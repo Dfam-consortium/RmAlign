@@ -1,26 +1,118 @@
 #!/usr/bin/env python3
 """
-RepeatMasker front-end for RmAlign:
+RepeatMasker
 
-- Normalizes key paths (sequence, project_dir, lib_file/library)
-- Requires at least one of: --species OR --lib_file/--library
-- Forwards unknown args to Nextflow unchanged
-- Runs main.nf relative to this script's directory
+  This is a wrapper for the Nextflow RepeatMasker pipeline.  This is
+  a convenience script to normalize to create a familiar interface to
+  the pipeline.
+
+  Basic functionality:
+  - Minimal environment checks for Nextflow and Java versions
+  - Creates project_dir if it doesn't already exist
+  - Changes into the project_dir so that Nextflow logs/work are placed there
+  - Invokes Nextflow
+  - Forwards unknown args to Nextflow unchanged
 """
 
 import argparse
 import os
+import re
 import sys
 import subprocess
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
+
+# TODO: Move this to some centralized config
+REQUIRED_NF = "25.04.6"
+REQUIRED_JAVA = "24.0.2"
 
 
-def _abs_path(p: str | os.PathLike | None) -> str | None:
+# ------------------------- path helpers -------------------------
+
+def _abs_path(p: str | os.PathLike | None) -> Optional[str]:
     if p is None:
         return None
     return str(Path(os.path.expandvars(str(p))).expanduser().resolve(strict=False))
 
+
+# ------------------------- version helpers -------------------------
+
+def _parse_version_tuple(v: str) -> Tuple[int, ...]:
+    """
+    Convert a version string into a tuple of ints for comparison.
+    Examples:
+      "25.04.6" -> (25, 4, 6)
+      "24.0.2"  -> (24, 0, 2)
+      "1.8.0_281" -> (1, 8, 0, 281)
+    """
+    v = v.strip().replace("_", ".")
+    parts = re.findall(r"\d+", v)
+    return tuple(int(x) for x in parts) if parts else (0,)
+
+def _version_gte(found: str, required: str) -> bool:
+    a = _parse_version_tuple(found)
+    b = _parse_version_tuple(required)
+    # pad to equal length
+    n = max(len(a), len(b))
+    a += (0,) * (n - len(a))
+    b += (0,) * (n - len(b))
+    return a >= b
+
+def _get_nextflow_version() -> Optional[str]:
+    """
+    Runs `nextflow -version` and extracts the first dotted version sequence.
+    Typical output includes a line like: "version 25.04.6 build ..."
+    """
+    try:
+        proc = subprocess.run(
+            ["nextflow", "-version"],
+            check=False, capture_output=True, text=True
+        )
+    except FileNotFoundError:
+        return None
+    out = (proc.stdout or "") + (proc.stderr or "")
+    m = re.search(r"(\d+\.\d+(?:\.\d+)*)", out)
+    return m.group(1) if m else None
+
+def _get_java_version() -> Optional[str]:
+    """
+    Runs `java -version` and extracts the quoted version string if present,
+    falling back to the first dotted sequence.
+    Typical output: openjdk version "24.0.2" ...
+    """
+    try:
+        proc = subprocess.run(
+            ["java", "-version"],
+            check=False, capture_output=True, text=True
+        )
+    except FileNotFoundError:
+        return None
+    out = (proc.stdout or "") + (proc.stderr or "")
+    m = re.search(r'"(\d+(?:\.\d+)+[^"]*)"', out)  # content inside quotes
+    if m:
+        return m.group(1)
+    m2 = re.search(r"(\d+\.\d+(?:\.\d+)*)", out)   # any dotted version
+    return m2.group(1) if m2 else None
+
+def _assert_runtime_versions() -> None:
+    nf_ver = _get_nextflow_version()
+    if nf_ver is None:
+        print("ERROR: Nextflow not found on PATH (need >= {})".format(REQUIRED_NF), file=sys.stderr)
+        sys.exit(127)
+    if not _version_gte(nf_ver, REQUIRED_NF):
+        print(f"ERROR: Nextflow {nf_ver} found, but {REQUIRED_NF}+ is required.", file=sys.stderr)
+        sys.exit(2)
+
+    java_ver = _get_java_version()
+    if java_ver is None:
+        print("ERROR: Java not found on PATH (need >= {})".format(REQUIRED_JAVA), file=sys.stderr)
+        sys.exit(127)
+    if not _version_gte(java_ver, REQUIRED_JAVA):
+        print(f"ERROR: Java {java_ver} found, but {REQUIRED_JAVA}+ is required.", file=sys.stderr)
+        sys.exit(2)
+
+
+# ------------------------- arg parsing -------------------------
 
 def parse_args() -> Tuple[argparse.Namespace, List[str]]:
     p = argparse.ArgumentParser(
@@ -47,6 +139,8 @@ def parse_args() -> Tuple[argparse.Namespace, List[str]]:
     return args, passthrough
 
 
+# ------------------------- main -------------------------
+
 def main() -> int:
     args, passthrough = parse_args()
 
@@ -59,27 +153,26 @@ def main() -> int:
     # Ensure project directory exists
     os.makedirs(project_abs, exist_ok=True)
 
-    # Update args so downstream code sees absolute values
-    args.sequence = sequence_abs
-    args.project_dir = project_abs
-    if lib_abs:
-        args.lib_file = lib_abs
-        args.library = lib_abs
-
-    # Resolve main.nf relative to this script
+    # Resolve main.nf relative to this script (absolute), prior to chdir
     script_dir = Path(__file__).resolve().parent
     main_nf = str((script_dir / "main.nf").resolve())
 
-    # Build Nextflow command
+    # Check runtime versions before launching
+    _assert_runtime_versions()
+
+    # IMPORTANT: Switch to project directory so NF logs/work are placed there
+    os.chdir(project_abs)
+
+    # Build the Nextflow command
     nf_cmd = [
         "nextflow", "run", main_nf,
         "--sequence", sequence_abs,
         "--project_dir", project_abs,
     ]
-
     if args.species:
         nf_cmd += ["--species", args.species]
     if lib_abs:
+        # pipeline expects --lib_file; keep alias logic upstream
         nf_cmd += ["--lib_file", lib_abs]
 
     # Forward unknown args to Nextflow as-is
@@ -95,4 +188,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
