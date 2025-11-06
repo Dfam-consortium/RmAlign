@@ -27,8 +27,12 @@ from typing import Generator, Iterable, TextIO
 from telib.formats import crossmatch
 from telib.runners.rmblast import RmblastOptions, run_rmblast
 
-DEFAULT_BLASTMAT_DIR = "/u3/home/rhubley/projects/RepeatMasker/Matrices/ncbi/nt"
-MAKEBLASTDB = "/usr/local/rmblast/bin/makeblastdb"
+# Determine the directory where this script resides
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Set BLAST matrices directory relative to the script location
+DEFAULT_BLASTMAT_DIR = os.path.join(SCRIPT_DIR, "Matrices", "ncbi", "nt")
+MAKEBLASTDB = "makeblastdb"
 
 
 def parse_args() -> argparse.Namespace:

@@ -1,4 +1,11 @@
-# Modular Workflow Pattern #3
+# RmAlign
+
+This is a project to work on the architecture of a RepeatMasker-like 
+family-wise alignment framework.  It has a main entry point script
+('RepeatMasker') which sets up a project directory (if it doesn't
+already exist) and turns orchestration over to Nextflow.
+
+## Modular Workflow Pattern
 
 Single workflow-spec (cluster and server-based) in Nextflow, with a 
 lightweight wrapper (BASH) script to "rebrand" the command *and*

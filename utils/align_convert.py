@@ -7,6 +7,7 @@ import sys
 from typing import Iterable, Iterator, Optional, Tuple
 
 # telib bits
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from telib import PairwiseAlignment
 from telib.formats import caf, crossmatch, bpaf, rmblast
 from telib.sequences.twobit import TwoBitSequenceSource
