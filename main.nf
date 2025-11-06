@@ -212,7 +212,7 @@ process ALIGN_TASK {
       --div ${rec.div} \\
       --gc  ${rec.gc} \\
       --threshold ${rec.threshold} \\
-      --library /u3/home/rhubley/projects/RepeatMasker5/data/lib.fa \\
+      --library /u3/home/rhubley/projects/RmAlign/data/lib.fa \\
       --threads 4
     echo done > ${token}
     """

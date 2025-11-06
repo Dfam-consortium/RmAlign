@@ -1,140 +1,98 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env python3
+"""
+RepeatMasker front-end for RmAlign:
 
-REQUIRED_NF="25.04.6"
-REQUIRED_JAVA="24.0.2"
+- Normalizes key paths (sequence, project_dir, lib_file/library)
+- Requires at least one of: --species OR --lib_file/--library
+- Forwards unknown args to Nextflow unchanged
+- Runs main.nf relative to this script's directory
+"""
 
-usage() {
-  cat <<EOF
-Usage: $(basename "$0") --project_dir DIR [other Nextflow args...]
+import argparse
+import os
+import sys
+import subprocess
+from pathlib import Path
+from typing import List, Tuple
 
-Validates:
-  - nextflow in PATH and >= ${REQUIRED_NF}
-  - java in PATH and >= ${REQUIRED_JAVA}
 
-Behavior:
-  - cd into --project_dir DIR (creates it if needed)
-  - Preserves semantics of relative *input* paths by absolutizing those that exist
-  - Invokes: nextflow run <ABSOLUTE main.nf> -work-dir <DIR> --project_dir <DIR> <other args>
-EOF
-}
+def _abs_path(p: str | os.PathLike | None) -> str | None:
+    if p is None:
+        return None
+    return str(Path(os.path.expandvars(str(p))).expanduser().resolve(strict=False))
 
-die() { echo "ERROR: $*" >&2; exit 1; }
 
-# Resolve versions like 25.04.6, 24.0.2, 17, 1.8.0_312
-ver_to_triplet() {
-  local v="${1#v}"; v="${v//_/.}"
-  awk -v V="$v" -F. '{a=$1+0; b=($2==""?0:$2)+0; c=($3==""?0:$3)+0; printf "%d %d %d\n", a,b,c}' <<<"$v"
-}
-ver_ge() {
-  read -r a b c <<<"$(ver_to_triplet "$1")"
-  read -r x y z <<<"$(ver_to_triplet "$2")"
-  if (( a > x )) || (( a == x && b > y )) || (( a == x && b == y && c >= z )); then return 0; else return 1; fi
-}
+def parse_args() -> Tuple[argparse.Namespace, List[str]]:
+    p = argparse.ArgumentParser(
+        prog="RepeatMasker",
+        description="RmAlign front-end that prepares a project dir and calls Nextflow."
+    )
 
-# Absolute path helper relative to the original working dir
-abspath_rel_to() {
-  local base="$1" path="$2"
-  if [[ "$path" = /* ]]; then printf '%s\n' "$path"
-  else
-    if command -v realpath >/dev/null 2>&1; then realpath -m -- "$base/$path"
-    else printf '%s/%s\n' "$base" "$path"
-    fi
-  fi
-}
+    # Inputs we will canonicalize
+    p.add_argument("--sequence", required=True, help="Input FASTA")
+    p.add_argument("--project_dir", required=True, help="Project work directory")
 
-# --- Early help
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then usage; exit 0; fi
+    # Either species OR a library must be provided (enforced manually)
+    p.add_argument("--species", help="Species (Dfam/RepeatMasker species tag)")
+    p.add_argument("--lib_file", help="Custom repeat library FASTA")
+    p.add_argument("--library", help="Alias for --lib_file")
 
-# --- Validate nextflow & java
-command -v nextflow >/dev/null 2>&1 || die "nextflow not found in PATH"
-nf_ver="$(nextflow -version 2>&1 | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
-[[ -n "$nf_ver" ]] || die "Unable to determine nextflow version"
-ver_ge "$nf_ver" "$REQUIRED_NF" || die "Nextflow $REQUIRED_NF or newer required; found $nf_ver"
+    args, passthrough = p.parse_known_args()
 
-command -v java >/dev/null 2>&1 || die "java not found in PATH"
-java_line="$(java -version 2>&1 | head -n1 || true)"
-java_ver="$(grep -Eo '[0-9]+([._][0-9]+){0,3}' <<<"$java_line" | head -n1 | tr '_' '.' || true)"
-[[ -n "$java_ver" ]] || die "Unable to determine Java version"
-ver_ge "$java_ver" "$REQUIRED_JAVA" || die "Java $REQUIRED_JAVA or newer required; found $java_ver"
+    # Validate either species or library given
+    if not (args.species or args.lib_file or args.library):
+        print("ERROR: Either --species OR --lib_file/--library must be provided.", file=sys.stderr)
+        sys.exit(2)
 
-# --- Capture the original CWD and the script dir (for main.nf)
-ORIG_CWD="$(pwd -P)"
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-NF_SCRIPT="${SCRIPT_DIR}/main.nf"
+    return args, passthrough
 
-# --- Parse wrapper CLI
-project_dir=""
-pass_through=()
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --project_dir)
-      [[ $# -ge 2 ]] || die "--project_dir requires an argument"
-      project_dir="$2"; shift 2 ;;
-    --project_dir=*)
-      project_dir="${1#*=}"; shift ;;
-    -h|--help)
-      usage; exit 0 ;;
-    *)
-      pass_through+=("$1"); shift ;;
-  esac
-done
+def main() -> int:
+    args, passthrough = parse_args()
 
-[[ -n "$project_dir" ]] || die "Missing required --project_dir DIR"
+    # Normalize key paths
+    lib_val = args.lib_file if args.lib_file else args.library
+    sequence_abs = _abs_path(args.sequence)
+    project_abs  = _abs_path(args.project_dir)
+    lib_abs      = _abs_path(lib_val) if lib_val else None
 
-# Absolutize project_dir relative to the ORIGINAL CWD
-project_dir="$(abspath_rel_to "$ORIG_CWD" "$project_dir")"
-mkdir -p -- "$project_dir"
+    # Ensure project directory exists
+    os.makedirs(project_abs, exist_ok=True)
 
-# Rewrite args so that any *existing file/dir* referenced relatively remains valid after cd
-rewritten=()
-i=0
-while (( i < ${#pass_through[@]} )); do
-  tok="${pass_through[i]}"
-  if [[ "$tok" == --*=* ]]; then
-    key="${tok%%=*}"; val="${tok#*=}"
-    if [[ "$val" != /* && -e "$ORIG_CWD/$val" ]]; then
-      val="$(abspath_rel_to "$ORIG_CWD" "$val")"
-      tok="${key}=${val}"
-    fi
-    rewritten+=("$tok"); ((i++))
-  elif [[ "$tok" == -* ]]; then
-    if (( i+1 < ${#pass_through[@]} )) && [[ "${pass_through[i+1]}" != -* ]]; then
-      val="${pass_through[i+1]}"
-      if [[ "$val" != /* && -e "$ORIG_CWD/$val" ]]; then
-        val="$(abspath_rel_to "$ORIG_CWD" "$val")"
-      fi
-      rewritten+=("$tok" "$val"); ((i+=2))
-    else
-      rewritten+=("$tok"); ((i++))
-    fi
-  else
-    # positional token; absolutize if it exists
-    val="$tok"
-    if [[ "$val" != /* && -e "$ORIG_CWD/$val" ]]; then
-      val="$(abspath_rel_to "$ORIG_CWD" "$val")"
-    fi
-    rewritten+=("$val"); ((i++))
-  fi
-done
+    # Update args so downstream code sees absolute values
+    args.sequence = sequence_abs
+    args.project_dir = project_abs
+    if lib_abs:
+        args.lib_file = lib_abs
+        args.library = lib_abs
 
-# Move into the project dir (Nextflow will create .nextflow here)
-cd -- "$project_dir"
+    # Resolve main.nf relative to this script
+    script_dir = Path(__file__).resolve().parent
+    main_nf = str((script_dir / "main.nf").resolve())
 
-# Disable update banner just in case
-export NXF_DISABLE_VERSION_CHECK=true
+    # Build Nextflow command
+    nf_cmd = [
+        "nextflow", "run", main_nf,
+        "--sequence", sequence_abs,
+        "--project_dir", project_abs,
+    ]
 
-# Build Nextflow command
-cmd=( nextflow run "$NF_SCRIPT" --project_dir "$project_dir" )
-cmd+=( "${rewritten[@]}" )
+    if args.species:
+        nf_cmd += ["--species", args.species]
+    if lib_abs:
+        nf_cmd += ["--lib_file", lib_abs]
 
-echo "Nextflow: $(command -v nextflow)"
-echo "Nextflow version: $nf_ver (requires >= $REQUIRED_NF)"
-echo "Java version: $java_ver (requires >= $REQUIRED_JAVA)"
-echo "Project dir: $project_dir"
-echo "CWD:         $(pwd -P)"
-echo
-echo "Executing: ${cmd[*]}"
+    # Forward unknown args to Nextflow as-is
+    nf_cmd += passthrough
 
-exec "${cmd[@]}"
+    try:
+        proc = subprocess.run(nf_cmd, check=False)
+        return proc.returncode
+    except FileNotFoundError:
+        print("ERROR: nextflow not found on PATH", file=sys.stderr)
+        return 127
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
