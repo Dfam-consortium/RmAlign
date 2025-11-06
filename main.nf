@@ -81,21 +81,6 @@ workflow {
     // Stage 1: generate_align_tasks.py -> produce align_tasks.json and project token
     GEN_ALIGN_TASKS(CH_SEQ, CH_PROJ, CH_LIB)
 
-    // Parse align_tasks.json and fan out ALIGN tasks
-    //GEN_ALIGN_TASKS.out.align_json
-    //    .map { f ->
-    //        def list = new JsonSlurper().parse(new File(f.toString()))
-    //        if (!(list instanceof List))
-    //            throw new IllegalStateException("align_tasks.json must be a JSON array")
-    //        list
-    //    }
-    //    .flatten()
-    //    .combine( GEN_ALIGN_TASKS.out.proj_after_align )
-    //    .combine( CH_SEQ )
-    //    .combine( CH_LIB )
-    //    .map { rec, proj, seq, lib_file -> [ rec as Map, seq as String, proj as String, lib_file as String ] }
-    //    .set { CH_ALIGN_TUPLES }
-
     // Parse align_tasks.jsonl (JSON Lines) and fan out ALIGN tasks
     GEN_ALIGN_TASKS.out.align_json
         .map { f ->
@@ -129,30 +114,30 @@ workflow {
     ALIGN_TASK.out.done_tokens.collect().set { CH_ALIGN_DONE_LIST }
 
     // Stage 3: generate_adjudication_tasks.py (after aligns)
-    GEN_ADJ_TASKS(CH_SEQ, GEN_ALIGN_TASKS.out.proj_after_align, CH_LIB, CH_ALIGN_DONE_LIST)
+    //GEN_ADJ_TASKS(CH_SEQ, GEN_ALIGN_TASKS.out.proj_after_align, CH_LIB, CH_ALIGN_DONE_LIST)
 
     // Parse adjudication_tasks.json and fan out ADJUDICATE tasks
-    GEN_ADJ_TASKS.out.adj_json
-        .map { f ->
-            def list = new JsonSlurper().parse(new File(f.toString()))
-            if (!(list instanceof List))
-                throw new IllegalStateException("adjudication_tasks.json must be a JSON array")
-            list
-        }
-        .flatten()
-        .combine( GEN_ADJ_TASKS.out.proj_after_adj )
-        .combine( CH_SEQ )
-        .combine( CH_LIB )
-        .map { rec, proj, seq, species -> [ rec as Map, seq as String, proj as String, species as String ] }
-        .set { CH_ADJ_TUPLES }
+    //GEN_ADJ_TASKS.out.adj_json
+    //    .map { f ->
+    //        def list = new JsonSlurper().parse(new File(f.toString()))
+    //        if (!(list instanceof List))
+    //            throw new IllegalStateException("adjudication_tasks.json must be a JSON array")
+    //        list
+    //    }
+    //    .flatten()
+    //    .combine( GEN_ADJ_TASKS.out.proj_after_adj )
+    //    .combine( CH_SEQ )
+    //    .combine( CH_LIB )
+    //    .map { rec, proj, seq, species -> [ rec as Map, seq as String, proj as String, species as String ] }
+    //    .set { CH_ADJ_TUPLES }
 
-    ADJUDICATE_TASK(CH_ADJ_TUPLES)
+    //ADJUDICATE_TASK(CH_ADJ_TUPLES)
 
     // Barrier: wait for all adjudications to finish
-    ADJUDICATE_TASK.out.done_tokens.collect().set { CH_ADJ_DONE_LIST }
+    //ADJUDICATE_TASK.out.done_tokens.collect().set { CH_ADJ_DONE_LIST }
 
     // Stage 5: postprocess_task.py (once, after adjudications)
-    POSTPROCESS_TASK(CH_SEQ, GEN_ADJ_TASKS.out.proj_after_adj, CH_LIB, CH_ADJ_DONE_LIST)
+    //POSTPROCESS_TASK(CH_SEQ, GEN_ADJ_TASKS.out.proj_after_adj, CH_LIB, CH_ADJ_DONE_LIST)
 }
 
 // --------------------
@@ -191,7 +176,7 @@ process ALIGN_TASK {
     tag { "align_${rec.family ?: 'x'}__${rec.sequence ?: 'x'}" }
 
     input:
-    tuple val(rec), val(seq), val(proj), val(species)
+    tuple val(rec), val(seq), val(proj), val(lib_file)
 
     output:
     path "*.align.done", emit: done_tokens
@@ -212,7 +197,8 @@ process ALIGN_TASK {
       --div ${rec.div} \\
       --gc  ${rec.gc} \\
       --threshold ${rec.threshold} \\
-      --library /u3/home/rhubley/projects/RmAlign/data/lib.fa \\
+      --tmpdir ${proj} \\
+      --library ${lib_file} \\
       --threads 4
     echo done > ${token}
     """

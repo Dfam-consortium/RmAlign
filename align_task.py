@@ -46,6 +46,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--threshold", type=float, default=None, help="Optional score threshold (simple post-filter).")
     p.add_argument("--library", required=True, help="Library FASTA containing multiple families.")
     p.add_argument("--threads", type=int, default=4, help="Number of threads for rmblast.")
+    p.add_argument("--tmpdir", default=None, help="Base directory for temporary files.")
     p.add_argument(
         "--output",
         help="Path to write Crossmatch output (text). If omitted, writes to stdout.",
@@ -133,7 +134,13 @@ def main() -> int:
         else:
             out = sys.stdout
 
-        with tempfile.TemporaryDirectory(prefix="rmblast_family_") as tmpd:
+        tmpdir_kwargs = {"prefix": "rmblast_family_"}
+        if args.tmpdir:
+            desired_tmp = os.path.expandvars(os.path.expanduser(args.tmpdir))
+            os.makedirs(desired_tmp, exist_ok=True)
+            tmpdir_kwargs["dir"] = desired_tmp
+
+        with tempfile.TemporaryDirectory(**tmpdir_kwargs) as tmpd:
             family_fa = os.path.join(tmpd, "family.fa")
             extract_family_record(args.library, args.family, family_fa)
             run_makeblastdb(family_fa)
