@@ -1,0 +1,793 @@
+# 1) RM Align format (no class_name; no '+' token)
+#    Forward:
+#      score sub del ins  query_name query_start query_end (query_left)
+#      subject_name subject_start subject_end (subject_left) [cat_id] [rm_id]
+#
+#    Example:
+#      770 12.90 0.00 0.08 Human 15 1203 (998797) (TGGTGG)n#Simple_repeat 1 1188 (0) m_b1s252i0 1
+#    Mapping:
+#      orient = ""
+#      class_name = None
+#      cat_id, rm_id, overlap parsed from trailing tokens (overlap rarely present in this variant)
+#
+#    Complement:
+#      score sub del ins  query_name query_start query_end (query_left)  C
+#      subject_name (subject_left) subject_end subject_start [cat_id] [rm_id]
+#
+#    Example:
+#      581 30.33 5.34 2.36 Human 2450 2655 (997345) C MIRb#SINE/MIR (29) 239 28 m_b1s601i5 6
+#    Mapping:
+#      orient = "C"
+#      class_name = None
+#      cat_id, rm_id, overlap parsed from trailing tokens
+#
+# 2) RM Out format (has '+' for forward or 'C' for complement; optional class_name)
+#    Forward:
+#      score sub del ins  query_name query_start query_end (query_left)  +
+#      subject_name [class_name ...] subject_start subject_end (subject_left) rm_id [overlap]
+#
+#    Example:
+#      770 12.9 0.0 0.1 Human 15 1203 (998797) + (TGGTGG)n Simple_repeat 1 1188 (0) 1 *
+#    Mapping:
+#      orient = "+"
+#      class_name = concatenation of tokens between subject_name and subject_start (may be multi-token; commonly "SINE/Alu")
+#      rm_id required in this variant; overlap is "*" if present
+#      cat_id is typically absent here (kept permissive in parser if encountered)
+#
+#    Complement:
+#      score sub del ins  query_name query_start query_end (query_left)  C
+#      subject_name [class_name ...] (subject_left) subject_end subject_start rm_id [overlap]
+#
+#    Example:
+#      581 29.4 6.1 6.3 Human 2450 2683 (997317) C MIRb SINE/MIR (29) 239 2 6
+#    Mapping:
+#      orient = "C"
+#      class_name = tokens between subject_name and the first '(subject_left)'
+#      rm_id required in this variant; overlap optional "*"
+#
+# -----------------------------
+# Disambiguation rules used by the parser
+# -----------------------------
+# - The presence of a literal '+' at column 8 → RM Out (forward).
+# - A literal 'C' at column 8 → complement variant (RM Align or RM Out depending on layout).
+# - Parenthesized tokens '(...)' mark *leftover* counts, and serve as reliable anchors to
+#   detect where class_name (if any) ends and coordinate fields begin.
+# - cat_id matches ^[mc]_b\\d+s\\d+i\\d+$ exactly.
+# - rm_id is an integer >= 0.
+# - overlap, when present, is a single '*'.
+#
+# -----------------------------
+# Writer behavior
+# -----------------------------
+# - Headers are written in consistent, space-separated form and will include:
+#   score percents, query fields, orientation token (if 'C' or '+'), subject fields, and optional rm_id/overlap.
+# - If class_name is present or rm_id/overlap is given, the writer uses the RM Out layout (with '+').
+#   Otherwise it uses the RM Align layout.
+# - matrix_name and kimura_div are written into the alignment block trailer when alignment strings are emitted.
+#
+# -----------------------------
+# Round-trip notes
+# -----------------------------
+# - perc_sub/perc_del/perc_ins are preserved as parsed.
+# - orient: "C" maps to orientation "-" in PairwiseAlignment; "+" or "" map to "+".
+# - When projecting to PairwiseAlignment, gap percentages are stored in
+#   query_gap_pct/target_gap_pct so that PairwiseAlignment.perc_ins()/perc_del() reflect the
+#   object’s reference (query or target) correctly. On writing, we re-emit the original percents.
+# - rm_id, cat_id, overlap, class_name are preserved on read → write.
+
+# telib/formats/crossmatch.py
+from __future__ import annotations
+
+import io
+import os
+import re
+import warnings
+from dataclasses import dataclass
+from itertools import chain
+
+from typing import Iterator, Type, TypeVar, overload, Union, TextIO, Sequence, Optional, List, Literal
+from telib import PairwiseAlignment
+
+T = TypeVar("T", "CrossmatchRecord", PairwiseAlignment)
+# ----------------------------------------------------------------------
+# Spec notes (concise)
+# ----------------------------------------------------------------------
+# RM Align format (no '+', subject may embed "#Class"):
+#   FWD: score sub del ins  qName qStart qEnd (qLeft)  sName              sStart sEnd (sLeft) [cat_id] [rm_id] [*]
+#   CMP: score sub del ins  qName qStart qEnd (qLeft)  C sName (sLeft)    sEnd   sStart      [cat_id] [rm_id] [*]
+#
+# RM Out format (has '+' for forward; optional class tokens separate from name):
+#   FWD: score sub del ins  qName qStart qEnd (qLeft)  + sName [class...] sStart sEnd (sLeft) rm_id [*]
+#   CMP: score sub del ins  qName qStart qEnd (qLeft)  C sName [class...] (sLeft) sEnd sStart rm_id [*]
+#
+# Optional trailers in either world:
+#   cat_id =~ ^[mc]_b\d+s\d+i\d+$     rm_id = int >= 0     overlap="*"
+#
+# Writer:
+#   - If class_name present, emit RM Out (“+”) layout.
+#   - Else emit RM Align layout (subject_name as-is; may contain "#Class").
+#   - Alignment block (if present) is emitted in 50-col stanzas with a mismatch line,
+#     blank line before/after block, “Matrix = …” (Unknown if missing), “Kimura …” (if set),
+#     “Transitions / transversions …” and “Gap_init …”.
+#
+# Round-trip:
+#   - perc_* preserved.
+#   - orient "C" ↔ orientation "-" in PairwiseAlignment.
+#   - query_left/subject_left, class_name, cat_id, rm_id, overlap preserved via PairwiseAlignment.meta.
+# ----------------------------------------------------------------------
+
+# -------------------------
+# Public record structure
+# -------------------------
+
+@dataclass
+class CrossmatchRecord:
+    # header fields
+    score: float
+    perc_sub: float
+    perc_del: float
+    perc_ins: float
+
+    query_name: str
+    query_start: int
+    query_end: int
+    query_left: int
+
+    # "" (forward) or "C" (complement)
+    orient: str
+
+    subject_name: str
+    subject_start: int
+    subject_end: int
+    subject_left: int
+
+    # Optional tail/extra metadata
+    class_name: Optional[str] = None    # e.g., "SINE/Alu"
+    cat_id: Optional[str] = None        # e.g., m_b123s45i6
+    overlap: Optional[str] = None       # often "*"
+    rm_id: Optional[int] = None         # >= 0
+
+    matrix_name: Optional[str] = None
+    kimura_div: Optional[float] = None
+    kimura_raw: Optional[float] = None
+    cpg_sites: Optional[int] = None
+
+    # Optional alignment strings (if present in the output)
+    aligned_query_seq: Optional[str] = None
+    aligned_subject_seq: Optional[str] = None
+
+
+# -------------------------
+# Internal helpers (parse)
+# -------------------------
+
+_CAT_RE = re.compile(r'[mc]_b\d+s\d+i\d+')
+
+def _parse_paren_int(s: str) -> int:
+    return int(s.strip("()"))
+
+def _is_paren(tok: str) -> bool:
+    return tok.startswith("(") and tok.endswith(")")
+
+def _find_paren(fields: list[str], start: int) -> int:
+    for i in range(start, len(fields)):
+        if _is_paren(fields[i]):
+            return i
+    return -1
+
+def _parse_tail_tokens(tokens: list[str]) -> tuple[Optional[str], Optional[int], Optional[str]]:
+    """
+    Parse optional tail tokens in a permissive way:
+      cat_id | cat_id rm_id | rm_id | rm_id *
+    Returns (cat_id, rm_id, overlap).
+    """
+    cat_id: Optional[str] = None
+    rm_id: Optional[int] = None
+    overlap: Optional[str] = None
+    for t in tokens:
+        if t == "*":
+            overlap = "*"
+            continue
+        if cat_id is None and _CAT_RE.fullmatch(t):
+            cat_id = t
+            continue
+        if rm_id is None and t.isdigit():
+            rm_id = int(t)
+            continue
+    return cat_id, rm_id, overlap
+
+
+def _try_parse_header_line(fields: list[str]) -> Optional[dict]:
+    """
+    Parse one Crossmatch header line from pre-split tokens.
+    Returns a dict (normalized) or None if not a header.
+    """
+    nf = len(fields)
+    if nf < 12:
+        return None
+
+    # first four numbers
+    try:
+        score = float(fields[0])
+        perc_sub = float(fields[1])
+        perc_del = float(fields[2])
+        perc_ins = float(fields[3])
+    except ValueError:
+        return None
+
+    qname = fields[4]
+    try:
+        qstart = int(fields[5])
+        qend   = int(fields[6])
+    except ValueError:
+        return None
+    if nf < 8 or not _is_paren(fields[7]):
+        return None
+    try:
+        qleft = _parse_paren_int(fields[7])
+    except Exception:
+        return None
+
+    orient_field = fields[8] if nf > 8 else ""
+
+    # Complement variants ('C')
+    if orient_field == "C":
+        if nf < 13:
+            return None
+        sname = fields[9]
+        j = _find_paren(fields, 10)  # (sLeft)
+        if j == -1 or j + 2 >= nf:
+            return None
+        class_tokens = fields[10:j]
+        class_name = " ".join(class_tokens) if class_tokens else None
+        try:
+            sleft = _parse_paren_int(fields[j])
+            send  = int(fields[j + 1])
+            sstart= int(fields[j + 2])
+        except ValueError:
+            return None
+        tail = fields[j + 3:] if (j + 3) < nf else []
+        cat_id, rm_id, overlap = _parse_tail_tokens(tail)
+        return {
+            "score": score, "perc_sub": perc_sub, "perc_del": perc_del, "perc_ins": perc_ins,
+            "qname": qname, "qstart": qstart, "qend": qend, "qleft": qleft,
+            "orient": "C",
+            "sname": sname, "sstart": sstart, "send": send, "sleft": sleft,
+            "class_name": class_name, "rm_id": rm_id, "cat_id": cat_id, "overlap": overlap,
+        }
+
+    # Forward RM Out ('+')
+    if orient_field == "+":
+        if nf < 14:
+            return None
+        sname = fields[9]
+        j = _find_paren(fields, 10)  # (sLeft)
+        if j == -1:
+            return None
+        if j - 2 < 10:
+            return None
+        try:
+            sstart = int(fields[j - 2])
+            send   = int(fields[j - 1])
+            sleft  = _parse_paren_int(fields[j])
+        except ValueError:
+            return None
+        class_tokens = fields[10: j - 2]
+        class_name = " ".join(class_tokens) if class_tokens else None
+        rm_id: Optional[int] = None
+        tail_start = j + 1
+        if tail_start < nf and fields[tail_start].isdigit():
+            rm_id = int(fields[tail_start])
+            tail_start += 1
+        tail = fields[tail_start:] if tail_start < nf else []
+        cat_id, _rm_id2, overlap = _parse_tail_tokens(tail)
+        if rm_id is None:
+            rm_id = _rm_id2
+        return {
+            "score": score, "perc_sub": perc_sub, "perc_del": perc_del, "perc_ins": perc_ins,
+            "qname": qname, "qstart": qstart, "qend": qend, "qleft": qleft,
+            "orient": "+",
+            "sname": sname, "sstart": sstart, "send": send, "sleft": sleft,
+            "class_name": class_name, "rm_id": rm_id, "cat_id": cat_id, "overlap": overlap,
+        }
+
+    # Forward RM Align (no '+')
+    sname = orient_field
+    if nf < 12:
+        return None
+    try:
+        sstart = int(fields[9])
+        send   = int(fields[10])
+    except ValueError:
+        return None
+    if not _is_paren(fields[11]):
+        return None
+    try:
+        sleft = _parse_paren_int(fields[11])
+    except Exception:
+        return None
+    tail = fields[12:] if nf > 12 else []
+    cat_id, rm_id, overlap = _parse_tail_tokens(tail)
+    return {
+        "score": score, "perc_sub": perc_sub, "perc_del": perc_del, "perc_ins": perc_ins,
+        "qname": qname, "qstart": qstart, "qend": qend, "qleft": qleft,
+        "orient": "",
+        "sname": sname, "sstart": sstart, "send": send, "sleft": sleft,
+        "class_name": None, "rm_id": rm_id, "cat_id": cat_id, "overlap": overlap,
+    }
+
+
+# -------------------------
+# Small helpers
+# -------------------------
+
+Source = Union[str, TextIO, Sequence[str]]
+
+def _clslines(source: Source) -> Iterator[str]:
+    if isinstance(source, str):
+        if os.path.exists(source) and os.path.isfile(source):
+            with open(source, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    yield line
+        else:
+            for line in io.StringIO(source):
+                yield line
+    elif hasattr(source, "read"):
+        for line in source:  # type: ignore[assignment]
+            yield line
+    else:
+        for line in source:
+            yield line
+
+def _validate_header_vs_sequences(r: CrossmatchRecord) -> None:
+    if r.aligned_query_seq and r.aligned_subject_seq:
+        if len(r.aligned_query_seq) != len(r.aligned_subject_seq):
+            raise ValueError("Aligned strings differ in length.")
+    if r.query_end < r.query_start:
+        raise ValueError("query_end < query_start.")
+    if r.subject_end < r.subject_start:
+        raise ValueError("subject_end < subject_start.")
+
+
+# -------------------------
+# Parser (records)
+# -------------------------
+
+def _iter_records(
+    source: Source,
+    *,
+    strict: bool = False,
+    on_error: str = "warn",
+) -> Iterator[CrossmatchRecord]:
+    it = _clslines(source)
+    cur: Optional[CrossmatchRecord] = None
+    top_seq: List[str] = []
+    bot_seq: List[str] = []
+    top_label: Optional[str] = None
+    bot_label: Optional[str] = None
+
+    def _flush_alignment() -> None:
+        nonlocal cur, top_seq, bot_seq
+        if cur is not None and top_seq and bot_seq:
+            cur.aligned_query_seq = "".join(top_seq)
+            cur.aligned_subject_seq = "".join(bot_seq)
+        top_seq, bot_seq = [], []
+
+    def _emit(cur_row: CrossmatchRecord) -> Iterator[CrossmatchRecord]:
+        ok = True
+        if strict:
+            try:
+                _validate_header_vs_sequences(cur_row)
+            except Exception as e:
+                if on_error == "raise":
+                    raise
+                if on_error == "skip":
+                    ok = False
+                else:
+                    warnings.warn(str(e))
+        if ok:
+            yield cur_row
+
+    for raw in it:
+        line = raw.rstrip("\n")
+
+        # End before non-alignment trailers many tools append
+        if line.startswith("Score histogram:"):
+            break
+
+        fields = line.split()
+        header = _try_parse_header_line(fields)
+        if header:
+            _flush_alignment()
+            cur = CrossmatchRecord(
+                score=header["score"],
+                perc_sub=header["perc_sub"],
+                perc_del=header["perc_del"],
+                perc_ins=header["perc_ins"],
+                query_name=header["qname"],
+                query_start=header["qstart"],
+                query_end=header["qend"],
+                query_left=header["qleft"],
+                orient=header["orient"],
+                subject_name=header["sname"],
+                subject_start=header["sstart"],
+                subject_end=header["send"],
+                subject_left=header["sleft"],
+                class_name=header["class_name"],
+                cat_id=header.get("cat_id"),
+                rm_id=header.get("rm_id"),
+                overlap=header.get("overlap"),
+            )
+            top_label = header["qname"]
+            bot_label = header["sname"]
+            continue
+
+        if cur:
+            # Alignment stanza lines
+            #   non-C:    label pos seq pos
+            #   complement: C label pos seq pos
+            is_alignment = False
+            lab = None
+            seq = None
+
+            if len(fields) >= 4 and fields[1].isdigit():
+                lab = fields[0]
+                seq = fields[2]
+                is_alignment = True
+            elif len(fields) >= 5 and fields[0] == "C" and fields[2].isdigit():
+                lab = fields[1]
+                seq = fields[3]
+                is_alignment = True
+
+            if is_alignment and seq is not None:
+                if top_label and lab.startswith(top_label[: len(lab)]):
+                    top_seq.append(seq)
+                    continue
+                if bot_label and lab.startswith(bot_label[: len(lab)]):
+                    bot_seq.append(seq)
+                    continue
+
+            # Trailer lines
+            if line.startswith("Matrix"):
+                parts = line.split("=", 1)
+                if len(parts) == 2 and cur is not None:
+                    cur.matrix_name = parts[1].strip()
+                continue
+
+            if line.startswith("Kimura"):
+                parts = line.split("=", 1)
+                if len(parts) == 2 and cur is not None:
+                    try:
+                        cur.kimura_div = float(parts[1].strip())
+                    except ValueError:
+                        pass
+                continue
+
+            if "Gap_init rate" in line or "gap_init rate" in line:
+                _flush_alignment()
+                if cur is not None:
+                    for _r in _emit(cur):
+                        yield _r
+                cur = None
+                top_label = bot_label = None
+                continue
+
+    if cur:
+        _flush_alignment()
+        for _r in _emit(cur):
+            yield _r
+
+
+# -------------------------
+# Record <-> PairwiseAlignment mapping
+# -------------------------
+
+def _record_to_alignment(r: CrossmatchRecord, *, reference: Literal["query","target"]) -> PairwiseAlignment:
+    # Store Crossmatch percents so PairwiseAlignment’s perc_* reflect `reference`
+    query_gap_pct = r.perc_ins
+    target_gap_pct = r.perc_del
+
+    a = PairwiseAlignment(
+        score=int(r.score),
+        query_id=r.query_name,
+        query_start=r.query_start,
+        query_end=r.query_end,
+        target_id=r.subject_name,
+        target_start=r.subject_start,
+        target_end=r.subject_end,
+        orientation="-" if r.orient == "C" else "+",
+        reference=reference,
+        perc_sub=r.perc_sub,
+        query_gap_pct=query_gap_pct,
+        target_gap_pct=target_gap_pct,
+        matrix_name=r.matrix_name,
+        kimura_div=r.kimura_div,
+    )
+
+    # stash format-specific bits
+    meta = {
+        "query_left": int(r.query_left),
+        "subject_left": int(r.subject_left),
+    }
+    if r.class_name is not None:
+        meta["class_name"] = r.class_name
+    if r.cat_id is not None:
+        meta["cat_id"] = r.cat_id
+    if r.rm_id is not None:
+        meta["rm_id"] = int(r.rm_id)
+    if r.overlap:
+        meta["overlap"] = r.overlap
+    if hasattr(a, "meta_update"):
+        a.meta_update(meta)
+
+    if r.aligned_query_seq and r.aligned_subject_seq:
+        a.aligned_query_seq = r.aligned_query_seq
+        a.aligned_target_seq = r.aligned_subject_seq
+    return a
+
+
+def _alignment_to_record(aln: PairwiseAlignment) -> CrossmatchRecord:
+    # Pull Crossmatch-specific metadata, if present
+    meta_get = getattr(aln, "meta_get", None)
+    get = (meta_get if callable(meta_get) else lambda k, d=None: d)
+    class_name = get("class_name")
+    cat_id = get("cat_id")
+    rm_id = get("rm_id")
+    overlap = get("overlap")
+    qleft_meta = get("query_left")
+    sleft_meta = get("subject_left")
+
+    perc_ins = float(aln.query_gap_pct or 0.0)
+    perc_del = float(aln.target_gap_pct or 0.0)
+
+    return CrossmatchRecord(
+        score=float(aln.score),
+        perc_sub=float(aln.perc_sub or 0.0),
+        perc_del=perc_del,
+        perc_ins=perc_ins,
+
+        query_name=aln.query_id,
+        query_start=aln.query_start,
+        query_end=aln.query_end,
+        query_left=int(qleft_meta) if qleft_meta is not None else (
+            max(0, (aln.query_len or aln.query_end) - aln.query_end) if aln.query_end else 0
+        ),
+
+        orient="C" if aln.orientation == "-" else "+",
+
+        subject_name=aln.target_id,
+        subject_start=aln.target_start,
+        subject_end=aln.target_end,
+        subject_left=int(sleft_meta) if sleft_meta is not None else (
+            max(0, (aln.target_len or aln.target_end) - aln.target_end) if aln.target_end else 0
+        ),
+
+        class_name=class_name,
+        cat_id=str(cat_id) if cat_id is not None else None,
+        rm_id=int(rm_id) if rm_id is not None else None,
+        overlap=str(overlap) if overlap else None,
+
+        matrix_name=aln.matrix_name,
+        kimura_div=aln.kimura_div,
+
+        aligned_query_seq=(
+            aln.aligned_query_seq if (aln.aligned_query_seq and aln.aligned_target_seq) else None
+        ),
+        aligned_subject_seq=(
+            aln.aligned_target_seq if (aln.aligned_query_seq and aln.aligned_target_seq) else None
+        ),
+    )
+
+
+# -------------------------
+# Writer (records -> text)
+# -------------------------
+
+def _tail_ids(r: CrossmatchRecord, *, include_rm: bool = True) -> str:
+    parts: list[str] = []
+    if r.cat_id:
+        parts.append(str(r.cat_id))
+    if include_rm and r.rm_id is not None:
+        parts.append(str(int(r.rm_id)))
+    if r.overlap == "*":
+        parts.append("*")
+    return (" " + " ".join(parts)) if parts else ""
+
+def _format_header_line(r: CrossmatchRecord) -> str:
+    left_q = f"({int(r.query_left)})"
+    left_s = f"({int(r.subject_left)})"
+
+    if r.orient == "C":
+        return (
+            f"{int(r.score)} {r.perc_sub:.2f} {r.perc_del:.2f} {r.perc_ins:.2f} "
+            f"{r.query_name} {r.query_start} {r.query_end} {left_q} "
+            f"C {r.subject_name} {left_s} {r.subject_end} {r.subject_start}"
+            f"{_tail_ids(r, include_rm=True)}\n"
+        )
+    else:
+        if r.class_name is not None:
+            return (
+                f"{int(r.score)} {r.perc_sub:.2f} {r.perc_del:.2f} {r.perc_ins:.2f} "
+                f"{r.query_name} {r.query_start} {r.query_end} {left_q} + "
+                f"{r.subject_name} {r.class_name} {r.subject_start} {r.subject_end} {left_s}"
+                f"{(' ' + str(int(r.rm_id))) if r.rm_id is not None else ''}"
+                f"{_tail_ids(r, include_rm=False)}\n"
+            )
+        # ALIGN layout
+        return (
+            f"{int(r.score)} {r.perc_sub:.2f} {r.perc_del:.2f} {r.perc_ins:.2f} "
+            f"{r.query_name} {r.query_start} {r.query_end} {left_q} "
+            f"{r.subject_name} {r.subject_start} {r.subject_end} {left_s}"
+            f"{_tail_ids(r, include_rm=True)}\n"
+        )
+
+def _format_alignment_block(r: CrossmatchRecord) -> str:
+    q = r.aligned_query_seq or ""
+    s = r.aligned_subject_seq or ""
+    n = min(len(q), len(s))
+
+    qname13 = (r.query_name or "")[:13]
+    sname13 = (r.subject_name or "")[:13]
+
+    q = q[:n]
+    s = s[:n]
+
+    lines: list[str] = []
+
+    q_pos = r.query_start
+    s_pos = r.subject_end if r.orient == "C" else r.subject_start
+
+    trans = {("C","T"),("T","C"),("A","G"),("G","A")}
+    ambig = set("BDHVRYKMSWNXbdhvrykmswnx")
+
+    width = 50
+    for i in range(0, n, width):
+        q_chunk = q[i:i+width]
+        s_chunk = s[i:i+width]
+
+        q_letters = sum(1 for c in q_chunk if c != "-")
+        s_letters = sum(1 for c in s_chunk if c != "-")
+
+        q_end_here = q_pos + q_letters - 1 if q_letters > 0 else q_pos
+        if r.orient == "C":
+            s_end_here = s_pos - s_letters + 1 if s_letters > 0 else s_pos
+        else:
+            s_end_here = s_pos + s_letters - 1 if s_letters > 0 else s_pos
+
+        # header → blank line before first stanza
+        if i == 0:
+            lines.append("\n")
+
+        lines.append(f"  {qname13:<13s}{q_pos:>11d} {q_chunk} {q_end_here:d}\n")
+
+        mid = []
+        for qc, sc in zip(q_chunk, s_chunk):
+            uq, us = qc.upper(), sc.upper()
+            if qc == "-" or sc == "-":
+                mid.append("-")
+            elif uq == us:
+                mid.append(" ")
+            elif (uq, us) in trans:
+                mid.append("i")
+            elif uq in ambig or us in ambig:
+                mid.append("?")
+            else:
+                mid.append("v")
+        lines.append(" " * 27 + "".join(mid) + "\n")
+
+        s_prefix = "C " if r.orient == "C" else "  "
+        lines.append(f"{s_prefix}{sname13:<13s}{s_pos:>11d} {s_chunk} {s_end_here:d}\n")
+        lines.append("\n")
+
+        q_pos = q_end_here + 1 if q_letters > 0 else q_pos
+        if r.orient == "C":
+            s_pos = s_end_here - 1 if s_letters > 0 else s_pos
+        else:
+            s_pos = s_end_here + 1 if s_letters > 0 else s_pos
+
+    lines.append(f"Matrix = {r.matrix_name or 'Unknown'}\n")
+    if r.kimura_div is not None:
+        lines.append(f"Kimura (with divCpGMod) = {r.kimura_div:.2f}\n")
+    lines.append("Transitions / transversions = 1.00 (0 / 0)\n")
+    lines.append("Gap_init rate = 0.00 (0 / 0), avg. gap size = 0.00 (0 / 0)\n")
+    lines.append("\n")
+    return "".join(lines)
+
+def _iter_encoded_from_records(
+    records: Iterable[CrossmatchRecord],
+    *,
+    include_alignment: bool = True,
+) -> Iterable[str]:
+    for r in records:
+        yield _format_header_line(r)
+        if not include_alignment:
+            continue
+        q = getattr(r, "aligned_query_seq", None)
+        s = getattr(r, "aligned_subject_seq", None)
+        if q and s:
+            if len(q) != len(s):
+                raise AssertionError(
+                    "aligned_query_seq and aligned_subject_seq must be the same length"
+                )
+            yield _format_alignment_block(r)
+
+
+# -------------------------
+# Public API
+# -------------------------
+
+@overload
+def decode(source: Source, *, cls: type["CrossmatchRecord"] = ..., strict: bool = False, on_error: str = "warn", reference: str = "query") -> Iterator["CrossmatchRecord"]: ...
+@overload
+def decode(source: Source, *, cls: type[PairwiseAlignment], strict: bool = False, on_error: str = "warn", reference: str = "query") -> Iterator[PairwiseAlignment]: ...
+
+def decode(
+    source: Source,
+    *,
+    cls: type[T] = CrossmatchRecord,
+    strict: bool = False,
+    on_error: str = "warn",
+    reference: str = "query",  # "query" or "target" basis for gap% mapping (only used for PairwiseAlignment)
+) -> Iterator[T]:
+    """
+    Stream-decode Crossmatch/RepeatMasker into either:
+      - CrossmatchRecord (default)
+      - PairwiseAlignment (when cls=PairwiseAlignment)
+
+    If cls=PairwiseAlignment, `reference` controls gap% semantics:
+      reference="query"  -> perc_ins = gaps in query row; perc_del = gaps in subject row
+      reference="target" -> perc_ins = gaps in subject row; perc_del = gaps in query row
+    """
+    if reference not in ("query", "target"):
+        raise ValueError("reference must be 'query' or 'target'")
+
+    rec_iter = _iter_records(source, strict=strict, on_error=on_error)
+
+    if cls is CrossmatchRecord:
+        # Allow passing reference=... without blowing up; it has no effect here.
+        return rec_iter  # type: ignore[return-value]
+
+    if cls is PairwiseAlignment:
+        def _gen() -> Iterator[PairwiseAlignment]:
+            for r in rec_iter:
+                yield _record_to_alignment(r, reference=reference)
+        return _gen()  # type: ignore[return-value]
+
+    raise TypeError(f"Unsupported cls={cls!r}; expected CrossmatchRecord or PairwiseAlignment")
+
+
+def encode(
+    items: Iterable[Union[PairwiseAlignment, CrossmatchRecord]],
+    *,
+    sink: Optional[Union[str, TextIO]] = None,
+    include_alignment: bool = True,
+) -> str:
+    """
+    Encode to Crossmatch text from either CrossmatchRecord or PairwiseAlignment streams.
+    Returns the emitted text; also writes to sink if provided.
+    """
+    def _as_records(seq: Iterable[Union[PairwiseAlignment, CrossmatchRecord]]) -> Iterable[CrossmatchRecord]:
+        for x in seq:
+            if isinstance(x, CrossmatchRecord):
+                yield x
+            elif isinstance(x, PairwiseAlignment):
+                yield _alignment_to_record(x)
+            else:
+                raise TypeError("encode() items must be PairwiseAlignment or CrossmatchRecord")
+
+    # Build the text
+    chunks = list(_iter_encoded_from_records(_as_records(items), include_alignment=include_alignment))
+    text = "".join(chunks)
+
+    # Write if requested
+    if sink is None:
+        return text
+    if isinstance(sink, str):
+        with open(sink, "w", encoding="utf-8") as f:
+            f.write(text)
+        return text
+    if hasattr(sink, "write"):
+        sink.write(text)
+        return ""
+    raise TypeError("sink must be a path string, a file-like with .write, or None")
+

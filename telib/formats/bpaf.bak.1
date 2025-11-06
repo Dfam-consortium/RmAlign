@@ -1,0 +1,823 @@
+# telib/formats/bpaf.py
+from __future__ import annotations
+
+import io
+import struct
+from dataclasses import dataclass
+from typing import Iterator, Type, TypeVar, overload, Union, Optional, Iterable, TextIO, BinaryIO, Any, Tuple, Literal
+from telib import PairwiseAlignment, SequenceSource
+
+T = TypeVar("T", "BpafRecord", PairwiseAlignment)
+
+from telib import PairwiseAlignment
+
+MAGIC = b"BPAF\x01"
+
+# =========================
+# Public types
+# =========================
+
+@dataclass
+class BpafCigar:
+    """CIGAR for BPAF v1: (match0, [(signed_indel, match_after_run), ...])."""
+    match0: int
+    pairs: list[tuple[int, int]]  # (indel signed, match >= 0)
+
+@dataclass(slots=True)
+class BpafRecord:
+    """Logical BPAF record as read/written by this module."""
+    query_id: str
+    target_id: str
+    query_start: int   # 1-based, fully-closed
+    query_end: int
+    target_start: int  # 1-based, fully-closed
+    target_end: int
+    orient_c: bool                       # True => target complemented (i.e., aln.orientation == '-')
+    scoring_system: Optional[str] = None
+    score_f: Optional[float] = None
+    evalue_f: Optional[float] = None
+    div_pm: Optional[int] = None
+    bpaf_cigar: Optional[BpafCigar] = None
+
+
+# =========================
+# CIGAR helpers
+# =========================
+
+def build_bpaf_cigar_from_aligned(top: str, bot: str) -> BpafCigar:
+    """
+    Build a BPAF cigar from two aligned strings.
+    Representation: first field is initial match run (match0),
+    then a list of (signed indel run length, following match run length).
+    Positive indel => insertion in TOP (gap in bottom).
+    Negative indel => deletion in TOP (gap in top).
+    """
+    if len(top) != len(bot):
+        raise ValueError("aligned strings must be equal length")
+    i = 0
+    n = len(top)
+    m0 = 0
+    pairs: list[tuple[int, int]] = []
+    have_any_match = False
+
+    while i < n:
+        # Gap runs (indels)
+        if top[i] == "-" or bot[i] == "-":
+            if top[i] != "-" and bot[i] == "-":
+                j = i
+                while j < n and top[j] != "-" and bot[j] == "-":
+                    j += 1
+                pairs.append((+(j - i), 0))
+                i = j
+                continue
+            if top[i] == "-" and bot[i] != "-":
+                j = i
+                while j < n and top[j] == "-" and bot[j] != "-":
+                    j += 1
+                pairs.append((-(j - i), 0))
+                i = j
+                continue
+        # Match run
+        j = i
+        while j < n and top[j] != "-" and bot[j] != "-":
+            j += 1
+        if j > i:
+            run = j - i
+            if not have_any_match and not pairs:
+                m0 += run
+            else:
+                if pairs:
+                    last_indel, last_m = pairs[-1]
+                    pairs[-1] = (last_indel, last_m + run)
+                else:
+                    m0 += run
+            have_any_match = True
+            i = j
+            continue
+        i += 1
+
+    return BpafCigar(match0=m0, pairs=pairs)
+
+# telib/formats/bpaf.py (new helper near the other CIGAR helpers)
+
+def ungapped_span_lengths(c: BpafCigar) -> tuple[int, int]:
+    """
+    Return (top_letters, bottom_letters) consumed by this cigar.
+    Positive indel => insertion in TOP (consumes top letters).
+    Negative indel => deletion in TOP (insertion in BOTTOM; consumes bottom letters).
+    """
+    top = c.match0
+    bot = c.match0
+    for indel, m in c.pairs:
+        if indel >= 0:
+            top += indel
+        else:
+            bot += -indel
+        top += m
+        bot += m
+    return top, bot
+
+
+def rebuild_aligned_from_bpaf_cigar(top_ungapped: str, bot_ungapped: str, c: BpafCigar) -> tuple[str, str]:
+    """
+    Rebuild two aligned rows from ungapped substrings and a BpafCigar.
+    Uses the same semantics as build_bpaf_cigar_from_aligned():
+      +indel -> insertion in TOP (gap in bottom),
+      -indel -> deletion in TOP (gap in top).
+    """
+    ti = bi = 0
+    out_t: list[str] = []
+    out_b: list[str] = []
+
+    # initial match
+    if c.match0:
+        out_t.append(top_ungapped[ti:ti + c.match0]); ti += c.match0
+        out_b.append(bot_ungapped[bi:bi + c.match0]); bi += c.match0
+
+    for indel, m in c.pairs:
+        if indel > 0:
+            # insertion in TOP
+            out_t.append(top_ungapped[ti:ti + indel]); ti += indel
+            out_b.append("-" * indel)
+        elif indel < 0:
+            # insertion in BOTTOM (= deletion in TOP)
+            k = -indel
+            out_t.append("-" * k)
+            out_b.append(bot_ungapped[bi:bi + k]); bi += k
+
+        if m:
+            out_t.append(top_ungapped[ti:ti + m]); ti += m
+            out_b.append(bot_ungapped[bi:bi + m]); bi += m
+
+    return ("".join(out_t), "".join(out_b))
+
+
+# --- add near the top-level helpers ---
+
+class _CountingWriter:
+    """Wrap a binary sink to count bytes written without requiring .tell()."""
+    def __init__(self, sink: BinaryIO):
+        self._sink = sink
+        self.count = 0
+
+    def write(self, b: bytes | bytearray | memoryview) -> int:
+        n = self._sink.write(b)
+        self.count += n
+        return n
+
+    def flush(self) -> None:
+        if hasattr(self._sink, "flush"):
+            self._sink.flush()
+
+def _encode_record_to_stream(meta: dict, cigar: BpafCigar, tabs: dict,
+                             sink: _CountingWriter, scratch: bytearray) -> None:
+    """Encode one record directly to sink. Reuses `scratch` to avoid reallocs."""
+    # Intern strings → indices
+    qidx = _intern_string(tabs, "q", meta["query_id"], ("qids", None))
+    tidx = _intern_string(tabs, "t", meta["target_id"], ("tids", None))
+    midx = _intern_string(tabs, "m", meta.get("scoring_system") or "unknown.scoring_system", ("mats", None))
+
+    # Build record body into scratch
+    rec = scratch
+    rec.clear()
+
+    # indices
+    _put_uleb(qidx, rec)
+    _put_uleb(tidx, rec)
+
+    # coords as start + len
+    q_len = meta["q_end"] - meta["q_start"] + 1
+    t_len = meta["t_end"] - meta["t_start"] + 1
+    _put_uleb(meta["q_start"], rec); _put_uleb(q_len, rec)
+    _put_uleb(meta["t_start"], rec); _put_uleb(t_len, rec)
+
+    # scoring system index
+    _put_uleb(midx, rec)
+
+    # flags + optional fields
+    FLG_ORIENT_C = 1 << 0
+    FLG_HAS_SCORE = 1 << 1
+    FLG_HAS_EVAL  = 1 << 2
+    FLG_HAS_DIV   = 1 << 3
+    flags = 0
+    if meta.get("orient_c"): flags |= FLG_ORIENT_C
+    if meta.get("score_f") is not None: flags |= FLG_HAS_SCORE
+    if meta.get("evalue_f") is not None: flags |= FLG_HAS_EVAL
+    if meta.get("div_pm") is not None: flags |= FLG_HAS_DIV
+    rec.append(flags & 0xFF)
+    if flags & FLG_HAS_SCORE: rec.extend(struct.pack("<f", float(meta["score_f"])))
+    if flags & FLG_HAS_EVAL:  rec.extend(struct.pack("<f", float(meta["evalue_f"])))
+    if flags & FLG_HAS_DIV:   rec.extend(struct.pack("<H", int(meta["div_pm"])))
+
+    # cigar
+    _encode_cigar(cigar, rec)
+
+    # Write [uleb(len), rec] directly to sink
+    hdr = bytearray()
+    _put_uleb(len(rec), hdr)
+    sink.write(hdr)
+    sink.write(rec)
+
+def _put_table_stream(strings: list[str], sink: _CountingWriter) -> None:
+    tmp = bytearray()
+    _put_uleb(len(strings), tmp)
+    sink.write(tmp)
+    for s in strings:
+        b = s.encode("utf-8")
+        tmp.clear()
+        _put_uleb(len(b), tmp)
+        sink.write(tmp)
+        sink.write(b)
+
+
+# =========================
+# ULEB128 / ZigZag
+# =========================
+
+def _zigzag(n: int) -> int:
+    return (n << 1) ^ (n >> 63 & 1)
+
+def _zigzag_decode(zz: int) -> int:
+    return (zz >> 1) ^ -(zz & 1)
+
+def _put_uleb(x: int, out: bytearray) -> None:
+    x = int(x)
+    while x >= 0x80:
+        out.append((x & 0x7F) | 0x80)
+        x >>= 7
+    out.append(x & 0x7F)
+
+def _get_uleb(buf: bytes, i: int) -> tuple[int, int]:
+    shift = 0
+    val = 0
+    while True:
+        b = buf[i]
+        i += 1
+        val |= (b & 0x7F) << shift
+        if (b & 0x80) == 0:
+            return val, i
+        shift += 7
+
+
+# =========================
+# Low-level encode helpers
+# =========================
+
+def _encode_cigar(c: BpafCigar, out: bytearray) -> None:
+    _put_uleb(len(c.pairs), out)
+    _put_uleb(c.match0, out)
+    for indel, m in c.pairs:
+        zz = _zigzag(indel) if indel < 0 else (indel << 1)
+        _put_uleb(zz, out)
+        _put_uleb(m, out)
+
+def _intern_string(tabs: dict, kind: str, value: str, list_key: tuple) -> int:
+    """
+    Intern `value` into a per-kind string table.
+      - kind: "q" | "t" | "m"
+      - list_key: ("qids", None) | ("tids", None) | ("mats", None)
+    Returns stable integer index.
+    """
+    key = (kind, value)
+    if list_key not in tabs:
+        tabs[list_key] = []
+    if key not in tabs:
+        idx = len(tabs[list_key])
+        tabs[key] = idx
+        tabs[list_key].append(value)
+    return tabs[key]
+
+def _record_from_alignment(a: PairwiseAlignment) -> tuple[dict, BpafCigar]:
+    meta = dict(
+        query_id=a.query_id,
+        target_id=a.target_id,
+        q_start=a.query_start,
+        q_end=a.query_end,
+        t_start=min(a.target_start, a.target_end),
+        t_end=max(a.target_start, a.target_end),
+        orient_c=(a.orientation == "-"),
+        scoring_system=a.matrix_name or "unknown.scoring_system",
+        score_f=float(a.score) if isinstance(a.score, (int, float)) else None,
+        evalue_f=getattr(a, "e_value", None),
+        div_pm=None,
+    )
+    if a.aligned_query_seq and a.aligned_target_seq:
+        cig = build_bpaf_cigar_from_aligned(a.aligned_query_seq, a.aligned_target_seq)
+    else:
+        raise ValueError("PairwiseAlignment must provide aligned strings for BPAF encoding")
+    return meta, cig
+
+def _record_from_bpaf_record(r: BpafRecord) -> tuple[dict, BpafCigar]:
+    if r.bpaf_cigar is None:
+        raise ValueError("BpafRecord requires bpaf_cigar for BPAF encoding")
+    meta = dict(
+        query_id=r.query_id,
+        target_id=r.target_id,
+        q_start=r.query_start,
+        q_end=r.query_end,
+        t_start=min(r.target_start, r.target_end),
+        t_end=max(r.target_start, r.target_end),
+        orient_c=bool(r.orient_c),
+        scoring_system=r.scoring_system or "unknown.scoring_system",
+        score_f=r.score_f,
+        evalue_f=r.evalue_f,
+        div_pm=r.div_pm,
+    )
+    return meta, r.bpaf_cigar
+
+def _record_from_dict(x: dict[str, Any]) -> tuple[dict, BpafCigar]:
+    meta = {
+        "query_id": x["query_id"], "target_id": x["target_id"],
+        "q_start": x["q_start"], "q_end": x["q_end"],
+        "t_start": x["t_start"], "t_end": x["t_end"],
+        "orient_c": bool(x.get("orient_c", False)),
+        "scoring_system": x.get("scoring_system", "unknown.scoring_system"),
+        "score_f": x.get("score_f"), "evalue_f": x.get("evalue_f"),
+        "div_pm": x.get("div_pm"),
+    }
+    if x.get("bpaf_cigar"):
+        cig = x["bpaf_cigar"]
+    else:
+        top = x.get("aligned_query_seq"); bot = x.get("aligned_target_seq")
+        if not top or not bot:
+            raise ValueError("dict record requires bpaf_cigar or aligned strings")
+        cig = build_bpaf_cigar_from_aligned(top, bot)
+    return meta, cig
+
+def _encode_record(meta: dict, cigar: BpafCigar, tabs: dict, sink: bytearray) -> None:
+    qid = meta["query_id"]
+    tid = meta["target_id"]
+    mat = meta.get("scoring_system") or "unknown.scoring_system"
+
+    qidx = _intern_string(tabs, "q", qid, ("qids", None))
+    tidx = _intern_string(tabs, "t", tid, ("tids", None))
+    midx = _intern_string(tabs, "m", mat, ("mats", None))
+
+    rec = bytearray()
+    # indices
+    _put_uleb(qidx, rec)
+    _put_uleb(tidx, rec)
+    # coords as start + len
+    q_len = meta["q_end"] - meta["q_start"] + 1
+    t_len = meta["t_end"] - meta["t_start"] + 1
+    _put_uleb(meta["q_start"], rec); _put_uleb(q_len, rec)
+    _put_uleb(meta["t_start"], rec); _put_uleb(t_len, rec)
+    # scoring system index
+    _put_uleb(midx, rec)
+    # flags + optional floats/short
+    FLG_ORIENT_C = 1 << 0
+    FLG_HAS_SCORE = 1 << 1
+    FLG_HAS_EVAL = 1 << 2
+    FLG_HAS_DIV = 1 << 3
+    flags = 0
+    if meta.get("orient_c"): flags |= FLG_ORIENT_C
+    if meta.get("score_f") is not None: flags |= FLG_HAS_SCORE
+    if meta.get("evalue_f") is not None: flags |= FLG_HAS_EVAL
+    if meta.get("div_pm") is not None: flags |= FLG_HAS_DIV
+    rec.append(flags & 0xFF)
+    if flags & FLG_HAS_SCORE: rec.extend(struct.pack("<f", float(meta["score_f"])))
+    if flags & FLG_HAS_EVAL:  rec.extend(struct.pack("<f", float(meta["evalue_f"])))
+    if flags & FLG_HAS_DIV:   rec.extend(struct.pack("<H", int(meta["div_pm"])))
+
+    # cigar
+    _encode_cigar(cigar, rec)
+
+    # prefix with length
+    _len = bytearray(); _put_uleb(len(rec), _len)
+    sink.extend(_len); sink.extend(rec)
+
+
+# =========================
+# Reader core
+# =========================
+
+Source = Union[str, bytes, bytearray, io.BufferedReader, io.BytesIO, BinaryIO]
+
+def _clsbytes(source: Source) -> bytes:
+    if isinstance(source, (bytes, bytearray)):
+        return bytes(source)
+    if isinstance(source, str):
+        with open(source, "rb") as f:
+            return f.read()
+    if hasattr(source, "read"):
+        b = source.read()
+        if isinstance(b, str):
+            raise TypeError("BPAF reader expects binary stream, got text")
+        return b
+    raise TypeError("Unsupported source type for BPAF reader")
+
+def _read_tables(buf: bytes, i: int) -> tuple[list[str], list[str], list[str], int]:
+    def _get_table(p: int) -> tuple[list[str], int]:
+        n, p = _get_uleb(buf, p)
+        arr: list[str] = []
+        for _ in range(n):
+            ln, p = _get_uleb(buf, p)
+            s = buf[p:p+ln].decode("utf-8"); p += ln
+            arr.append(s)
+        return arr, p
+    qids, i = _get_table(i)
+    tids, i = _get_table(i)
+    mats, i = _get_table(i)
+    return qids, tids, mats, i
+
+def _decode_cigar(buf: bytes, i: int) -> tuple[BpafCigar, int]:
+    npairs, i = _get_uleb(buf, i)
+    m0, i = _get_uleb(buf, i)
+    pairs: list[tuple[int, int]] = []
+    for _ in range(npairs):
+        zz, i = _get_uleb(buf, i)
+        indel = _zigzag_decode(zz)
+        m, i = _get_uleb(buf, i)
+        pairs.append((indel, m))
+    return BpafCigar(match0=m0, pairs=pairs), i
+
+def _decode_record(buf: bytes, i: int, qids: list[str], tids: list[str], mats: list[str]) -> tuple[BpafRecord, int]:
+    reclen, i = _get_uleb(buf, i)
+    end = i + reclen
+
+    qidx, i = _get_uleb(buf, i)
+    tidx, i = _get_uleb(buf, i)
+
+    q_start, i = _get_uleb(buf, i)
+    q_len,   i = _get_uleb(buf, i)
+    t_start, i = _get_uleb(buf, i)
+    t_len,   i = _get_uleb(buf, i)
+
+    midx, i = _get_uleb(buf, i)
+
+    flags = buf[i]; i += 1
+    score_f = evalue_f = None
+    div_pm = None
+    if flags & (1 << 1):  # HAS_SCORE
+        (score_f,) = struct.unpack_from("<f", buf, i); i += 4
+    if flags & (1 << 2):  # HAS_EVAL
+        (evalue_f,) = struct.unpack_from("<f", buf, i); i += 4
+    if flags & (1 << 3):  # HAS_DIV
+        (div_pm,) = struct.unpack_from("<H", buf, i); i += 2
+
+    cigar, i = _decode_cigar(buf, i)
+    i = end  # safety
+
+    rec = BpafRecord(
+        query_id=qids[qidx],
+        target_id=tids[tidx],
+        query_start=q_start,
+        query_end=q_start + q_len - 1,
+        target_start=t_start,
+        target_end=t_start + t_len - 1,
+        orient_c=bool(flags & 1),
+        scoring_system=mats[midx] if 0 <= midx < len(mats) else "unknown.scoring_system",
+        score_f=score_f,
+        evalue_f=evalue_f,
+        div_pm=div_pm,
+        bpaf_cigar=cigar,
+    )
+    return rec, i
+
+def _encode_record_from_bpaf(
+    r: BpafRecord, tabs: dict, sink: _CountingWriter, scratch: bytearray
+) -> None:
+    # intern once
+    qidx = _intern_string(tabs, "q", r.query_id, ("qids", None))
+    tidx = _intern_string(tabs, "t", r.target_id, ("tids", None))
+    midx = _intern_string(tabs, "m", r.scoring_system or "unknown.scoring_system", ("mats", None))
+
+    rec = scratch; rec.clear()
+
+    # indices
+    _put_uleb(qidx, rec)
+    _put_uleb(tidx, rec)
+
+    # coords as start + len
+    _put_uleb(r.query_start, rec)
+    _put_uleb(r.query_end - r.query_start + 1, rec)
+    _put_uleb(min(r.target_start, r.target_end), rec)
+    _put_uleb(max(r.target_start, r.target_end) - min(r.target_start, r.target_end) + 1, rec)
+
+    # scoring system index
+    _put_uleb(midx, rec)
+
+    # flags + optionals
+    FLG_ORIENT_C = 1 << 0
+    FLG_HAS_SCORE = 1 << 1
+    FLG_HAS_EVAL  = 1 << 2
+    FLG_HAS_DIV   = 1 << 3
+
+    flags = 0
+    if r.orient_c: flags |= FLG_ORIENT_C
+    if r.score_f is not None: flags |= FLG_HAS_SCORE
+    if r.evalue_f is not None: flags |= FLG_HAS_EVAL
+    if r.div_pm is not None: flags |= FLG_HAS_DIV
+
+    rec.append(flags & 0xFF)
+    if flags & FLG_HAS_SCORE: rec.extend(struct.pack("<f", float(r.score_f)))
+    if flags & FLG_HAS_EVAL:  rec.extend(struct.pack("<f", float(r.evalue_f)))
+    if flags & FLG_HAS_DIV:   rec.extend(struct.pack("<H", int(r.div_pm)))
+
+    # cigar
+    _encode_cigar(r.bpaf_cigar, rec)  # type: ignore[arg-type]
+
+    # emit [uleb(len), rec]
+    hdr = bytearray()
+    _put_uleb(len(rec), hdr)
+    sink.write(hdr)
+    sink.write(rec)
+
+
+def bpaf_records(source: Source) -> Iterator[BpafRecord]:
+    """
+    Stream BpafRecord objects from a BPAF byte source (path/bytes/stream).
+    Mirrors the older public function name that tests expect.
+    """
+    data = _clsbytes(source)
+
+    # minimal validation + footer walk-back
+    if not data.startswith(MAGIC) or len(data) < len(MAGIC) + 8 + len(MAGIC):
+        raise ValueError("BPAF: invalid or too-short file")
+    if data[-len(MAGIC):] != MAGIC:
+        raise ValueError("BPAF: missing footer MAGIC")
+
+    tables_start = int.from_bytes(
+        data[-(8 + len(MAGIC)) : -len(MAGIC)], "little", signed=False
+    )
+    if not (len(MAGIC) <= tables_start <= len(data) - (8 + len(MAGIC))):
+        raise ValueError("BPAF: invalid tables_start offset")
+
+    qids, tids, mats, _ = _read_tables(data, tables_start)
+
+    i = len(MAGIC)
+    end_records = tables_start
+    while i < end_records:
+        rec, i = _decode_record(data, i, qids, tids, mats)
+        yield rec
+
+
+# =========================
+# Public API (mirrors Crossmatch)
+# =========================
+
+@overload
+def decode(source: Source, *, cls: Type["BpafRecord"] = ..., seqs: Optional[Union[SequenceSource, Tuple[SequenceSource, SequenceSource]]] = ...) -> Iterator["BpafRecord"]: ...
+@overload
+def decode(source: Source, *, cls: Type[PairwiseAlignment], seqs: Optional[Union[SequenceSource, Tuple[SequenceSource, SequenceSource]]] = ...) -> Iterator[PairwiseAlignment]: ...
+
+def decode(
+    source: Source,
+    *,
+    cls: Type[T] = BpafRecord,
+    seqs: Optional[Union[SequenceSource, Tuple[SequenceSource, SequenceSource]]] = None,
+) -> Iterator[T]:
+    """
+    Stream-decode BPAF v1 into BpafRecord (default) or PairwiseAlignment (cls=PairwiseAlignment).
+
+    If `seqs` is provided, the decoder rebuilds
+    aligned_query_seq/aligned_target_seq using the record's coordinates, orient_c,
+    and the bpaf_cigar.
+    """
+    def _maybe_fill(r: BpafRecord) -> None:
+        if seqs is None or r.bpaf_cigar is None:
+            return
+        # choose sources
+        if isinstance(seqs, tuple):
+            qsrc, tsrc = seqs
+        else:
+            qsrc = tsrc = seqs
+
+        # Ungapped lengths that must be fetched
+        top_len, bot_len = ungapped_span_lengths(r.bpaf_cigar)
+
+        # Query is always on '+' strand with respect to the reference alignment direction
+        q_ungapped = qsrc.get(r.query_id, r.query_start, r.query_end, "+")
+        if len(q_ungapped) != top_len:
+            # be forgiving if the provider returns different casing/unknowns; only length must match
+            q_ungapped = q_ungapped[:top_len]
+        # Target is reverse-complemented if orient_c is True
+        t_strand = "-" if r.orient_c else "+"
+        t_start  = min(r.target_start, r.target_end)
+        t_end    = max(r.target_start, r.target_end)
+        t_ungapped = tsrc.get(r.target_id, t_start, t_end, t_strand)
+        if len(t_ungapped) != bot_len:
+            t_ungapped = t_ungapped[:bot_len]
+
+        top_aln, bot_aln = rebuild_aligned_from_bpaf_cigar(q_ungapped, t_ungapped, r.bpaf_cigar)
+        # Attach on the record so cls=BpafRecord can expose, and cls=PairwiseAlignment can reuse.
+        r.aligned_query_seq = top_aln  # you may want to add these attrs to BpafRecord
+        r.aligned_target_seq = bot_aln
+
+    rec_iter = bpaf_records(source)  # existing generator of BpafRecord
+
+    if cls is BpafRecord:
+        def _iter() -> Iterator[BpafRecord]:
+            for r in rec_iter:
+                _maybe_fill(r)
+                yield r
+        return _iter()  # type: ignore[return-value]
+
+    if cls is PairwiseAlignment:
+        def _gen() -> Iterator[PairwiseAlignment]:
+            for r in rec_iter:
+                _maybe_fill(r)
+                yield PairwiseAlignment(
+                    score=int(r.score_f) if isinstance(r.score_f, (int, float)) else 0,
+                    query_id=r.query_id,
+                    query_start=r.query_start,
+                    query_end=r.query_end,
+                    target_id=r.target_id,
+                    target_start=min(r.target_start, r.target_end),
+                    target_end=max(r.target_start, r.target_end),
+                    orientation="-" if r.orient_c else "+",
+                    reference="query",
+                    e_value=r.evalue_f,
+                    matrix_name=r.scoring_system,
+                    aligned_query_seq=getattr(r, "aligned_query_seq", None),
+                    aligned_target_seq=getattr(r, "aligned_target_seq", None),
+                )
+        return _gen()  # type: ignore[return-value]
+
+    raise TypeError(f"Unsupported cls={cls!r}; expected BpafRecord or PairwiseAlignment")
+
+
+def encode(
+    items: Iterable[Union[PairwiseAlignment, BpafRecord, dict]],
+    *,
+    sink: Optional[Union[str, io.BufferedWriter, io.BytesIO]] = None,
+    kind: Optional[str] = None,          # 'bpaf' | 'alignment' | 'dict' (skip sniffing)
+    strict_types: bool = True,           # fail fast if mixed types
+) -> bytes:
+    # --- open sink ----------------------------------------------------
+    close_when_done = False
+    if sink is None:
+        out = io.BytesIO()
+    elif isinstance(sink, str):
+        out = open(sink, "wb"); close_when_done = True
+    elif hasattr(sink, "write"):
+        out = sink  # type: ignore[assignment]
+    else:
+        raise TypeError("sink must be a path or binary file-like")
+
+    cw = _CountingWriter(out)
+    tabs: dict = {}
+    scratch = bytearray()
+
+    # header
+    cw.write(MAGIC)
+
+    # lock adapter once
+    it = iter(items)
+    try:
+        first = next(it)
+    except StopIteration:
+        # empty stream → empty tables + footer
+        tables_start = cw.count
+        _put_table_stream([], cw); _put_table_stream([], cw); _put_table_stream([], cw)
+        cw.write(int(tables_start).to_bytes(8, "little", signed=False))
+        cw.write(MAGIC); cw.flush()
+        try:
+            return out.getvalue() if isinstance(out, io.BytesIO) else b""
+        finally:
+            if close_when_done: out.close()
+
+    # decide how to adapt → BpafRecord (one-time)
+    if kind is None:
+        if isinstance(first, BpafRecord): kind = "bpaf"
+        elif isinstance(first, PairwiseAlignment): kind = "alignment"
+        elif isinstance(first, dict): kind = "dict"
+        else:
+            raise TypeError("encode(): unsupported input type; use kind={'bpaf','alignment','dict'}")
+
+    # optional homogeneity check
+    if strict_types:
+        expected = {"bpaf": BpafRecord, "alignment": PairwiseAlignment, "dict": dict}[kind]
+        if not isinstance(first, expected):
+            raise TypeError(f"encode(): expected homogeneous {expected.__name__} items")
+
+    # adapt `first` inline
+    if kind == "bpaf":
+        rec = first  # type: ignore[assignment]
+        if rec.bpaf_cigar is None:
+            raise ValueError("BpafRecord missing bpaf_cigar")
+        _encode_record_from_bpaf(rec, tabs, cw, scratch)
+    elif kind == "alignment":
+        x = first  # type: ignore[assignment]
+        if not x.aligned_query_seq or not x.aligned_target_seq:
+            raise ValueError("PairwiseAlignment requires aligned strings to build bpaf_cigar")
+        cig = build_bpaf_cigar_from_aligned(x.aligned_query_seq, x.aligned_target_seq)
+        _encode_record_from_bpaf(BpafRecord(
+            query_id=x.query_id, target_id=x.target_id,
+            query_start=x.query_start, query_end=x.query_end,
+            target_start=min(x.target_start, x.target_end),
+            target_end=max(x.target_start, x.target_end),
+            orient_c=(x.orientation == "-"),
+            scoring_system=x.matrix_name or "unknown.scoring_system",
+            score_f=float(x.score) if isinstance(x.score, (int, float)) else None,
+            evalue_f=getattr(x, "e_value", None),
+            div_pm=None,
+            bpaf_cigar=cig,
+        ), tabs, cw, scratch)
+    elif kind == "dict":
+        x = first  # type: ignore[assignment]
+        cig = x.get("bpaf_cigar")
+        if cig is None:
+            top = x.get("aligned_query_seq"); bot = x.get("aligned_target_seq")
+            if not top or not bot:
+                raise ValueError("dict requires bpaf_cigar or aligned strings")
+            cig = build_bpaf_cigar_from_aligned(top, bot)
+        t0, t1 = x["t_start"], x["t_end"]
+        _encode_record_from_bpaf(BpafRecord(
+            query_id=x["query_id"], target_id=x["target_id"],
+            query_start=x["q_start"], query_end=x["q_end"],
+            target_start=min(t0, t1), target_end=max(t0, t1),
+            orient_c=bool(x.get("orient_c", False)),
+            scoring_system=x.get("scoring_system") or "unknown.scoring_system",
+            score_f=x.get("score_f"), evalue_f=x.get("evalue_f"), div_pm=x.get("div_pm"),
+            bpaf_cigar=cig,
+        ), tabs, cw, scratch)
+    else:
+        raise TypeError("encode(): kind must be 'bpaf', 'alignment', or 'dict'")
+
+    # hot loop: same adapter path; no isinstance checks
+    for obj in it:
+        if strict_types:
+            expected = {"bpaf": BpafRecord, "alignment": PairwiseAlignment, "dict": dict}[kind]
+            if not isinstance(obj, expected):
+                raise TypeError(f"encode(): mixed input types; saw {type(obj).__name__} after {expected.__name__}")
+
+        if kind == "bpaf":
+            r = obj  # type: ignore[assignment]
+            if r.bpaf_cigar is None:
+                raise ValueError("BpafRecord missing bpaf_cigar")
+            _encode_record_from_bpaf(r, tabs, cw, scratch)
+
+        elif kind == "alignment":
+            a = obj  # type: ignore[assignment]
+            if not a.aligned_query_seq or not a.aligned_target_seq:
+                raise ValueError("PairwiseAlignment requires aligned strings to build bpaf_cigar")
+            cig = build_bpaf_cigar_from_aligned(a.aligned_query_seq, a.aligned_target_seq)
+            _encode_record_from_bpaf(BpafRecord(
+                query_id=a.query_id, target_id=a.target_id,
+                query_start=a.query_start, query_end=a.query_end,
+                target_start=min(a.target_start, a.target_end),
+                target_end=max(a.target_start, a.target_end),
+                orient_c=(a.orientation == "-"),
+                scoring_system=a.matrix_name or "unknown.scoring_system",
+                score_f=float(a.score) if isinstance(a.score, (int, float)) else None,
+                evalue_f=getattr(a, "e_value", None),
+                div_pm=None,
+                bpaf_cigar=cig,
+            ), tabs, cw, scratch)
+
+        else:  # kind == "dict"
+            d = obj  # type: ignore[assignment]
+            cig = d.get("bpaf_cigar")
+            if cig is None:
+                top = d.get("aligned_query_seq"); bot = d.get("aligned_target_seq")
+                if not top or not bot:
+                    raise ValueError("dict requires bpaf_cigar or aligned strings")
+                cig = build_bpaf_cigar_from_aligned(top, bot)
+            t0, t1 = d["t_start"], d["t_end"]
+            _encode_record_from_bpaf(BpafRecord(
+                query_id=d["query_id"], target_id=d["target_id"],
+                query_start=d["q_start"], query_end=d["q_end"],
+                target_start=min(t0, t1), target_end=max(t0, t1),
+                orient_c=bool(d.get("orient_c", False)),
+                scoring_system=d.get("scoring_system") or "unknown.scoring_system",
+                score_f=d.get("score_f"), evalue_f=d.get("evalue_f"), div_pm=d.get("div_pm"),
+                bpaf_cigar=cig,
+            ), tabs, cw, scratch)
+
+    # tables + footer
+    tables_start = cw.count
+    _put_table_stream(tabs.get(("qids", None), []), cw)
+    _put_table_stream(tabs.get(("tids", None), []), cw)
+    _put_table_stream(tabs.get(("mats", None), []), cw)
+    cw.write(int(tables_start).to_bytes(8, "little", signed=False))
+    cw.write(MAGIC); cw.flush()
+
+    try:
+        return out.getvalue() if isinstance(out, io.BytesIO) else b""
+    finally:
+        if close_when_done:
+            out.close()
+
+def bpaf_cigar_to_text(c: BpafCigar, *, reference: Literal["query", "target"] = "query") -> str:
+    if reference not in ("query", "target"):
+        raise ValueError("reference must be 'query' or 'target'")
+
+    parts: list[str] = []
+    if c.match0:
+        parts.append(f"{c.match0}M")
+
+    for indel, m in c.pairs:
+        if indel == 0:
+            op = ""  # tolerate, though shouldn't happen
+        else:
+            if reference == "query":
+                # gap in target (indel>0) => D ; gap in query (indel<0) => I
+                op = "D" if indel > 0 else "I"
+            else:  # reference == "target"
+                # gap in target (indel>0) => I ; gap in query (indel<0) => D
+                op = "I" if indel > 0 else "D"
+        parts.append(f"{abs(indel)}{op}")
+        if m:
+            parts.append(f"{m}M")
+    return "".join(parts)

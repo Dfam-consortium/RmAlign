@@ -1,0 +1,303 @@
+# telib/sequences/twobit.py
+from __future__ import annotations
+
+import io
+import struct
+from dataclasses import dataclass
+from typing import Dict, Iterable, Optional
+
+from .base import SequenceSource, reverse_complement
+
+__all__ = ["TwoBitSequenceSource"]
+
+# UCSC 2bit constants
+TWOBIT_SIGNATURE = 0x1A412743
+DNA_DECODE = {0: "T", 1: "C", 2: "A", 3: "G"}
+
+DNA_DECODE_BYTES = [b"T", b"C", b"A", b"G"]
+_LUT_4BASES = [b""] * 256
+for _b in range(256):
+    _LUT_4BASES[_b] = (
+        DNA_DECODE_BYTES[(_b >> 6) & 3] +
+        DNA_DECODE_BYTES[(_b >> 4) & 3] +
+        DNA_DECODE_BYTES[(_b >> 2) & 3] +
+        DNA_DECODE_BYTES[_b & 3]
+    )
+
+@dataclass
+class _TwoBitEntry:
+    name: str
+    offset: int  # absolute file offset of the record (dnaSize field)
+
+
+@dataclass
+class TwoBitSequenceSource(SequenceSource):
+    """
+    Minimal UCSC 2bit reader with v0/v1 index support.
+
+    - Detects endianness from the magic (0x1A412743).
+    - Reads header {version:u32, sequenceCount:u32, reserved:u32}.
+    - Index entries:
+        v0: nameLen:u8, name:bytes, offset:u32
+        v1: nameLen:u8, name:bytes, offset:u64
+    - Record layout (common for v0 and v1):
+        dnaSize:u32
+        nBlockCount:u32, nBlockStarts[nBlockCount]:u32, nBlockSizes[nBlockCount]:u32
+        maskBlockCount:u32, maskStarts[maskCount]:u32, maskSizes[maskCount]:u32   (ignored for case)
+        reserved:u32
+        packedDNA: ceil(dnaSize/4) bytes (T=0, C=1, A=2, G=3)
+    - Returns uppercase sequences; N blocks applied.
+    - Coordinates for get(): 1-based, fully-closed; reverse-complement if strand == '-'.
+    - Caches decoded sequences in memory after the first access.
+    """
+    path: str  # path to .2bit file
+
+    # Private attributes populated during __post_init__:
+    #   _endian: str ('>' or '<')
+    #   _version: int (0 or 1)
+    #   _entries: Dict[str, _TwoBitEntry]
+    #   _cache: Dict[str, str]
+
+    def __post_init__(self):
+        self._entries: Dict[str, _TwoBitEntry] = {}
+        self._cache: Dict[str, str] = {}
+
+        with open(self.path, "rb") as f:
+            # --- Magic / endianness ---
+            sig_bytes = f.read(4)
+            if len(sig_bytes) != 4:
+                raise ValueError("Not a 2bit file (too short for signature)")
+            sig_be = struct.unpack(">I", sig_bytes)[0]
+            sig_le = struct.unpack("<I", sig_bytes)[0]
+
+            if sig_be == TWOBIT_SIGNATURE:
+                endian = ">"
+            elif sig_le == TWOBIT_SIGNATURE:
+                endian = "<"
+            else:
+                raise ValueError("Not a 2bit file (bad signature)")
+            self._endian = endian
+
+            # --- Header ---
+            hdr = f.read(12)
+            if len(hdr) != 12:
+                raise ValueError("Not a 2bit file (truncated header)")
+            version, count, _reserved = struct.unpack(f"{endian}III", hdr)
+            if version not in (0, 1):
+                raise ValueError(f"Unsupported 2bit version {version}")
+            self._version = int(version)
+
+            # --- Index ---
+            for _ in range(count):
+                b = f.read(1)
+                if not b:
+                    raise ValueError("Truncated 2bit index (name length)")
+                (name_len,) = struct.unpack("B", b)  # 1 byte, endianness irrelevant
+
+                name_b = f.read(name_len)
+                if len(name_b) != name_len:
+                    raise ValueError("Truncated 2bit index (name)")
+                name = name_b.decode("ascii")
+
+                if version == 0:
+                    off_b = f.read(4)
+                    if len(off_b) != 4:
+                        raise ValueError("Truncated 2bit index (offset32)")
+                    (offset,) = struct.unpack(f"{endian}I", off_b)
+                else:
+                    off_b = f.read(8)
+                    if len(off_b) != 8:
+                        raise ValueError("Truncated 2bit index (offset64)")
+                    (offset,) = struct.unpack(f"{endian}Q", off_b)
+
+                self._entries[name] = _TwoBitEntry(name=name, offset=int(offset))
+
+    # ----------------------------
+    # SequenceSource implementation
+    # ----------------------------
+
+    def has(self, seq_id: str) -> bool:
+        return seq_id in self._entries
+
+    def ids(self) -> Iterable[str]:
+        return self._entries.keys()
+
+    def length(self, seq_id: str) -> int:
+        if seq_id in self._cache:
+            return len(self._cache[seq_id])
+        entry = self._entries.get(seq_id)
+        if entry is None:
+            raise KeyError(f"2bit: sequence id {seq_id!r} not found")
+        with open(self.path, "rb") as f:
+            f.seek(entry.offset)
+            b = f.read(4)
+            if len(b) != 4:
+                raise ValueError("Truncated 2bit record (dnaSize)")
+            (dna_size,) = struct.unpack(f"{self._endian}I", b)
+            return int(dna_size)
+
+    def _decode_sequence_bytes(self, seq_id: str) -> str:
+        entry = self._entries.get(seq_id)
+        if entry is None:
+            raise KeyError(f"2bit: sequence id {seq_id!r} not found")
+        endian = self._endian
+
+        with open(self.path, "rb") as f:
+            f.seek(entry.offset)
+
+            # dnaSize
+            b = f.read(4)
+            if len(b) != 4:
+                raise ValueError("Truncated 2bit record (dnaSize)")
+            dna_size = struct.unpack(f"{endian}I", b)[0]
+
+            # N blocks
+            b = f.read(4)
+            if len(b) != 4:
+                raise ValueError("Truncated 2bit record (nBlockCount)")
+            n_block_count = struct.unpack(f"{endian}I", b)[0]
+
+            if n_block_count:
+                nb = f.read(4 * n_block_count)
+                if len(nb) != 4 * n_block_count:
+                    raise ValueError("Truncated 2bit record (nStarts)")
+                n_starts = struct.unpack(f"{endian}{n_block_count}I", nb)
+
+                nb = f.read(4 * n_block_count)
+                if len(nb) != 4 * n_block_count:
+                    raise ValueError("Truncated 2bit record (nSizes)")
+                n_sizes = struct.unpack(f"{endian}{n_block_count}I", nb)
+            else:
+                n_starts = ()
+                n_sizes = ()
+
+            # Mask blocks (ignored for case)
+            b = f.read(4)
+            if len(b) != 4:
+                raise ValueError("Truncated 2bit record (maskBlockCount)")
+            mask_count = struct.unpack(f"{endian}I", b)[0]
+            if mask_count:
+                # skip maskStarts + maskSizes
+                f.seek(8 * mask_count, io.SEEK_CUR)
+
+            # reserved
+            f.seek(4, io.SEEK_CUR)
+
+            # Packed DNA
+            nbytes = (dna_size + 3) // 4
+            packed = f.read(nbytes)
+            if len(packed) != nbytes:
+                raise ValueError("Truncated 2bit record (packed DNA)")
+
+        # --- FAST DECODE ---
+        # Map each packed byte to 4 ASCII bases and trim to dna_size
+        # This is ~10x faster than per-nibble Python loops.
+        seq_bytes = b"".join(_LUT_4BASES[b] for b in packed)
+        if len(seq_bytes) != nbytes * 4:
+            # extremely defensive; shouldn't happen
+            raise RuntimeError("2bit decode: LUT expansion length mismatch")
+        seq_bytes = seq_bytes[:dna_size]  # drop the trailing padding bases
+
+        # Apply N blocks via slice assignment (fast)
+        buf = bytearray(seq_bytes)
+        for st, sz in zip(n_starts, n_sizes):
+            lo = max(0, int(st))
+            hi = min(int(st) + int(sz), int(dna_size))
+            if lo < hi:
+                buf[lo:hi] = b"N" * (hi - lo)
+
+        return buf.decode("ascii")
+
+
+    def _decode_sequence_bytesOLD(self, seq_id: str) -> str:
+        entry = self._entries.get(seq_id)
+        if entry is None:
+            raise KeyError(f"2bit: sequence id {seq_id!r} not found")
+        endian = self._endian
+
+        with open(self.path, "rb") as f:
+            f.seek(entry.offset)
+
+            # dnaSize
+            b = f.read(4)
+            if len(b) != 4:
+                raise ValueError("Truncated 2bit record (dnaSize)")
+            dna_size = struct.unpack(f"{endian}I", b)[0]
+
+            # N blocks
+            b = f.read(4)
+            if len(b) != 4:
+                raise ValueError("Truncated 2bit record (nBlockCount)")
+            n_block_count = struct.unpack(f"{endian}I", b)[0]
+
+            if n_block_count:
+                nb = f.read(4 * n_block_count)
+                if len(nb) != 4 * n_block_count:
+                    raise ValueError("Truncated 2bit record (nStarts)")
+                n_starts = list(struct.unpack(f"{endian}{n_block_count}I", nb))
+
+                nb = f.read(4 * n_block_count)
+                if len(nb) != 4 * n_block_count:
+                    raise ValueError("Truncated 2bit record (nSizes)")
+                n_sizes = list(struct.unpack(f"{endian}{n_block_count}I", nb))
+            else:
+                n_starts, n_sizes = [], []
+
+            # Mask blocks (ignored for case)
+            b = f.read(4)
+            if len(b) != 4:
+                raise ValueError("Truncated 2bit record (maskBlockCount)")
+            mask_count = struct.unpack(f"{endian}I", b)[0]
+            if mask_count:
+                # skip maskStarts + maskSizes
+                f.seek(8 * mask_count, io.SEEK_CUR)
+
+            # reserved
+            f.seek(4, io.SEEK_CUR)
+
+            # Packed DNA
+            nbytes = (dna_size + 3) // 4
+            packed = f.read(nbytes)
+            if len(packed) != nbytes:
+                raise ValueError("Truncated 2bit record (packed DNA)")
+
+        # Decode 2-bit nybbles to bases
+        bases: list[str] = []
+        for byte in packed:
+            codes = [(byte >> 6) & 0x03, (byte >> 4) & 0x03, (byte >> 2) & 0x03, byte & 0x03]
+            for code in codes:
+                if len(bases) == dna_size:
+                    break
+                bases.append(DNA_DECODE[code])
+
+        # Apply N blocks (clamped)
+        for st, sz in zip(n_starts, n_sizes):
+            lo = max(0, int(st))
+            hi = min(int(st) + int(sz), int(dna_size))
+            for i in range(lo, hi):
+                bases[i] = "N"
+
+        return "".join(bases)
+
+    def _ensure_decoded(self, seq_id: str) -> str:
+        if seq_id not in self._entries:
+            raise KeyError(f"2bit: sequence id {seq_id!r} not found")
+        s = self._cache.get(seq_id)
+        if s is None:
+            s = self._decode_sequence_bytes(seq_id)
+            if not isinstance(s, str):
+                raise RuntimeError("2bit internal error: decoded sequence is not a string")
+            self._cache[seq_id] = s
+        return s
+
+    def get(self, seq_id: str, start: int, end: int, strand: str = "+") -> str:
+        # Normalize & validate (1-based, fully closed)
+        if start < 1 or end < start:
+            raise ValueError("invalid range")
+        s = self._ensure_decoded(seq_id)  # KeyError if missing id
+        end = min(end, len(s))
+        if start > end:
+            return ""
+        frag = s[start - 1 : end]
+        return frag if strand != "-" else reverse_complement(frag)
+

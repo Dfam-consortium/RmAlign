@@ -1,0 +1,5 @@
+attic/
+notebook
+*.pyc 
+**/__pycache__
+*~
