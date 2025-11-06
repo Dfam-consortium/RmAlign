@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-cbatcher.py — Python port matching the Rust workflow & CLI.
+generate_align_tasks.py
 
 Workflow:
   1) Validate --sequence (filename, size_bytes, mtime_ns, partial raw-file hash).
-  2) Validate --library per-sequence signatures; if no {added,modified,removed} and not --force-update → short-circuit (no batching/jobs).
+  2) Validate --library per-sequence signatures; if no {added,modified,removed} and not --force-update.
   3) Batch the sequence (fixed chunk size + overlap), compute GC%, write batch table to <project_dir>/sequence/batches.(tsv|json).
      Optionally emit per-chunk FASTAs (seq#.fa) OR GC-binned FASTAs ({35g,37g,...,53g}.fa) under <project_dir>/sequence.
   4) Emit jobs per (family_id, gc_bin), filtered to (added + modified) families on update runs (all families on first run).
