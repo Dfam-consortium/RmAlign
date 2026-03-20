@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 import argparse, sys, time
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from _version import __version__
 
 def parse_args(argv):
     p = argparse.ArgumentParser(description="Run a single adjudication task.")
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     p.add_argument("--sequence", required=True)
     p.add_argument("--project_dir", required=True)
     p.add_argument("--species", required=True)

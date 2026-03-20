@@ -17,10 +17,14 @@ RepeatMasker
 import argparse
 import os
 import re
+import shutil
 import sys
 import subprocess
+import time
 from pathlib import Path
 from typing import List, Tuple, Optional
+
+from _version import __version__
 
 # TODO: Move this to some centralized config
 REQUIRED_NF = "25.04.6"
@@ -58,21 +62,24 @@ def _version_gte(found: str, required: str) -> bool:
     b += (0,) * (n - len(b))
     return a >= b
 
-def _get_nextflow_version() -> Optional[str]:
+def _get_nextflow_version() -> Tuple[Optional[str], Optional[str]]:
     """
-    Runs `nextflow -version` and extracts the first dotted version sequence.
-    Typical output includes a line like: "version 25.04.6 build ..."
+    Locate nextflow via shutil.which, then run `nextflow -version`.
+    Returns (version_string, resolved_path) or (None, None) if not found.
     """
+    nf_path = shutil.which("nextflow")
+    if nf_path is None:
+        return None, None
     try:
         proc = subprocess.run(
-            ["nextflow", "-version"],
+            [nf_path, "-version"],
             check=False, capture_output=True, text=True
         )
-    except FileNotFoundError:
-        return None
+    except (FileNotFoundError, OSError):
+        return None, nf_path
     out = (proc.stdout or "") + (proc.stderr or "")
     m = re.search(r"(\d+\.\d+(?:\.\d+)*)", out)
-    return m.group(1) if m else None
+    return (m.group(1) if m else None), nf_path
 
 def _get_java_version() -> Optional[str]:
     """
@@ -80,12 +87,15 @@ def _get_java_version() -> Optional[str]:
     falling back to the first dotted sequence.
     Typical output: openjdk version "24.0.2" ...
     """
+    java_path = shutil.which("java")
+    if java_path is None:
+        return None
     try:
         proc = subprocess.run(
-            ["java", "-version"],
+            [java_path, "-version"],
             check=False, capture_output=True, text=True
         )
-    except FileNotFoundError:
+    except (FileNotFoundError, OSError):
         return None
     out = (proc.stdout or "") + (proc.stderr or "")
     m = re.search(r'"(\d+(?:\.\d+)+[^"]*)"', out)  # content inside quotes
@@ -94,22 +104,41 @@ def _get_java_version() -> Optional[str]:
     m2 = re.search(r"(\d+\.\d+(?:\.\d+)*)", out)   # any dotted version
     return m2.group(1) if m2 else None
 
-def _assert_runtime_versions() -> None:
-    nf_ver = _get_nextflow_version()
-    if nf_ver is None:
-        print("ERROR: Nextflow not found on PATH (need >= {})".format(REQUIRED_NF), file=sys.stderr)
-        sys.exit(127)
-    if not _version_gte(nf_ver, REQUIRED_NF):
-        print(f"ERROR: Nextflow {nf_ver} found, but {REQUIRED_NF}+ is required.", file=sys.stderr)
-        sys.exit(2)
-
+def _assert_runtime_versions() -> str:
+    """Check Java then Nextflow versions; return resolved nextflow executable path."""
+    # Check Java first — Nextflow requires it and will silently fail without it.
     java_ver = _get_java_version()
     if java_ver is None:
-        print("ERROR: Java not found on PATH (need >= {})".format(REQUIRED_JAVA), file=sys.stderr)
+        print(
+            f"ERROR: Java not found on PATH (need >= {REQUIRED_JAVA}).\n"
+            f"       PATH seen by Python: {os.environ.get('PATH', '<unset>')}",
+            file=sys.stderr,
+        )
         sys.exit(127)
     if not _version_gte(java_ver, REQUIRED_JAVA):
         print(f"ERROR: Java {java_ver} found, but {REQUIRED_JAVA}+ is required.", file=sys.stderr)
         sys.exit(2)
+
+    nf_ver, nf_path = _get_nextflow_version()
+    if nf_path is None:
+        print(
+            f"ERROR: Nextflow not found on PATH (need >= {REQUIRED_NF}).\n"
+            f"       PATH seen by Python: {os.environ.get('PATH', '<unset>')}",
+            file=sys.stderr,
+        )
+        sys.exit(127)
+    if nf_ver is None:
+        print(
+            f"ERROR: Found nextflow at {nf_path!r} but could not parse its version output "
+            f"(require >= {REQUIRED_NF}).",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if not _version_gte(nf_ver, REQUIRED_NF):
+        print(f"ERROR: Nextflow {nf_ver} found, but {REQUIRED_NF}+ is required.", file=sys.stderr)
+        sys.exit(2)
+
+    return nf_path
 
 
 # ------------------------- arg parsing -------------------------
@@ -119,6 +148,7 @@ def parse_args() -> Tuple[argparse.Namespace, List[str]]:
         prog="RepeatMasker",
         description="RmAlign front-end that prepares a project dir and calls Nextflow."
     )
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
     # Inputs we will canonicalize
     p.add_argument("--sequence", required=True, help="Input FASTA")
@@ -126,14 +156,33 @@ def parse_args() -> Tuple[argparse.Namespace, List[str]]:
 
     # Either species OR a library must be provided (enforced manually)
     p.add_argument("--species", help="Species (Dfam/RepeatMasker species tag)")
-    p.add_argument("--lib_file", help="Custom repeat library FASTA")
-    p.add_argument("--library", help="Alias for --lib_file")
+    p.add_argument("--library", help="Custom repeat library FASTA")
+    p.add_argument("--search-threshold", type=int, default=None, metavar="INT",
+                   help="Override rmblastn -min_raw_gapped_score for all families. "
+                        "If omitted, each family uses its own final_threshold as the search threshold.")
+    p.add_argument("--final-threshold", type=int, default=225, metavar="INT",
+                   help="Default post-alignment score threshold for families with no s_thresh= "
+                        "in their library header (default: 225).")
+    p.add_argument("--force-update", action="store_true",
+                   help="Force re-processing even if the sequence/library appears unchanged, "
+                        "or to accept a major version upgrade on an existing project.")
+    p.add_argument("--cpus", type=int, default=4, metavar="N",
+                   help="CPU threads per alignment task for local execution (default: 4).")
+    p.add_argument("--nf_profile", default=None, metavar="PROFILE",
+                   help="Nextflow profile to activate (e.g. rmcluster for SLURM). "
+                        "Omit to run locally using --cpus threads per task.")
+    p.add_argument("--log-level", default="INFO",
+                   choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                   help="Logging verbosity for pipeline tools (default: INFO). "
+                        "DEBUG writes per-task log files to <project_dir>/logs/.")
+    p.add_argument("--debug", action="store_true",
+                   help="Shorthand for --log-level DEBUG; also enables Nextflow -trace output.")
 
     args, passthrough = p.parse_known_args()
 
     # Validate either species or library given
-    if not (args.species or args.lib_file or args.library):
-        print("ERROR: Either --species OR --lib_file/--library must be provided.", file=sys.stderr)
+    if not (args.species or args.library):
+        print("ERROR: Either --species OR --library must be provided.", file=sys.stderr)
         sys.exit(2)
 
     return args, passthrough
@@ -145,7 +194,7 @@ def main() -> int:
     args, passthrough = parse_args()
 
     # Normalize key paths
-    lib_val = args.lib_file if args.lib_file else args.library
+    lib_val = args.library
     sequence_abs = _abs_path(args.sequence)
     project_abs  = _abs_path(args.project_dir)
     lib_abs      = _abs_path(lib_val) if lib_val else None
@@ -157,33 +206,171 @@ def main() -> int:
     script_dir = Path(__file__).resolve().parent
     main_nf = str((script_dir / "main.nf").resolve())
 
-    # Check runtime versions before launching
-    _assert_runtime_versions()
+    # Check runtime versions before launching; get resolved nextflow path
+    nf_exe = _assert_runtime_versions()
 
     # IMPORTANT: Switch to project directory so NF logs/work are placed there
     os.chdir(project_abs)
 
+    print("##")
+    print("##")
+    print(f"##  RepeatMasker Search Prototype {__version__}")
+    print("##")
+    print("##")
     # Build the Nextflow command
     nf_cmd = [
-        "nextflow", "run", main_nf,
+        nf_exe, "run", main_nf,
         "--sequence", sequence_abs,
         "--project_dir", project_abs,
     ]
     if args.species:
         nf_cmd += ["--species", args.species]
     if lib_abs:
-        # pipeline expects --lib_file; keep alias logic upstream
-        nf_cmd += ["--lib_file", lib_abs]
+        nf_cmd += ["--library", lib_abs]
+    if args.search_threshold is not None:
+        nf_cmd += ["--search_threshold", str(args.search_threshold)]
+    nf_cmd += ["--final_threshold",    str(args.final_threshold)]
+    nf_cmd += ["--force_update",       "true" if args.force_update        else "false"]
+    nf_cmd += ["--threads",            str(args.cpus)]
+
+    log_level = "DEBUG" if args.debug else args.log_level
+    nf_cmd += ["--log_level", log_level]
+
+    if args.nf_profile:
+        nf_cmd += ["-profile", args.nf_profile]
 
     # Forward unknown args to Nextflow as-is
     nf_cmd += passthrough
+    if args.debug:
+        nf_cmd += ["-trace", "nextflow"]
+
+    run_start = time.time()
 
     try:
         proc = subprocess.run(nf_cmd, check=False)
-        return proc.returncode
-    except FileNotFoundError:
-        print("ERROR: nextflow not found on PATH", file=sys.stderr)
+    except (FileNotFoundError, OSError) as exc:
+        print(f"ERROR: could not launch nextflow ({nf_exe!r}): {exc}", file=sys.stderr)
         return 127
+
+    _report_after_run(
+        returncode=proc.returncode,
+        work_root=Path(project_abs) / "work",
+        log_dir=Path(project_abs) / "logs",
+        run_start=run_start,
+        log_level=log_level,
+    )
+
+    if proc.returncode == 0 and log_level != "DEBUG":
+        _cleanup_work_dir(Path(project_abs) / "work")
+
+    return proc.returncode
+
+
+# ---- cleanup ----
+
+def _cleanup_work_dir(work_root: Path) -> None:
+    if work_root.exists():
+        shutil.rmtree(work_root, ignore_errors=True)
+        print(f"[info] Removed Nextflow work directory: {work_root}")
+
+
+# ---- reporting helpers ----
+
+# Ordered from least to most severe so threshold comparisons work correctly.
+_LOG_LEVEL_ORDER = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+
+
+def _report_after_run(
+    returncode: int,
+    work_root: Path,
+    log_dir: Path,
+    run_start: float,
+    log_level: str,
+) -> None:
+    """Display task log files and, on failure, Nextflow work-dir stderr."""
+    _display_task_logs(log_dir, log_level)
+    if returncode != 0:
+        _print_task_errors(work_root, run_start)
+
+
+def _display_task_logs(log_dir: Path, log_level: str) -> None:
+    """
+    Scan <project_dir>/logs/ and print entries at or above *log_level*.
+
+    In DEBUG mode every line is shown.  In INFO/WARNING/ERROR mode only lines
+    whose embedded [LEVEL] tag meets the threshold are printed.
+    """
+    if not log_dir.exists():
+        return
+
+    log_files = sorted(log_dir.glob("*.log"))
+    if not log_files:
+        return
+
+    threshold_idx = _LOG_LEVEL_ORDER.index(log_level.upper()) \
+        if log_level.upper() in _LOG_LEVEL_ORDER else 2  # default WARNING
+
+    bar = "─" * 70
+    any_header_printed = False
+
+    for lf in log_files:
+        try:
+            lines = lf.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+
+        relevant = [
+            line for line in lines
+            if any(
+                f"[{lvl}" in line
+                for lvl in _LOG_LEVEL_ORDER[threshold_idx:]
+            )
+        ]
+
+        if not relevant:
+            continue
+
+        if not any_header_printed:
+            print(f"\n{bar}", file=sys.stderr)
+            print("Pipeline logs:", file=sys.stderr)
+            any_header_printed = True
+
+        print(f"\n  [{lf.name}]", file=sys.stderr)
+        for line in relevant:
+            print(f"  {line}", file=sys.stderr)
+
+    if any_header_printed:
+        print(bar, file=sys.stderr)
+
+
+def _print_task_errors(work_root: Path, since: float) -> None:
+    """
+    After a failed Nextflow run, find tasks that exited non-zero during this
+    run (mtime >= since) and print their stderr to the user as a clean summary.
+    """
+    failures: List[Tuple[Path, str]] = []
+    for exit_file in sorted(work_root.glob("*/*/.exitcode")):
+        try:
+            if exit_file.stat().st_mtime < since:
+                continue
+            if exit_file.read_text().strip() == "0":
+                continue
+            err_file = exit_file.parent / ".command.err"
+            if err_file.exists() and err_file.stat().st_size > 0:
+                failures.append((exit_file.parent, err_file.read_text().strip()))
+        except OSError:
+            continue
+
+    if not failures:
+        return
+
+    bar = "─" * 70
+    print(f"\n{bar}", file=sys.stderr)
+    print("Nextflow task errors:", file=sys.stderr)
+    for work_dir, msg in failures:
+        print(bar, file=sys.stderr)
+        print(msg, file=sys.stderr)
+    print(bar, file=sys.stderr)
 
 
 if __name__ == "__main__":

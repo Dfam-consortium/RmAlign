@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 import argparse, json, sys, time
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from _version import __version__
 
 def parse_args(argv):
     p = argparse.ArgumentParser(description="Postprocess results.")
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     p.add_argument("--sequence", required=True)
     p.add_argument("--project_dir", required=True)
     p.add_argument("--species", required=True)
@@ -18,8 +21,8 @@ def main(argv=None):
     outdir    = proj / "results" / "SUMMARIZE"
     outdir.mkdir(parents=True, exist_ok=True)
 
-    n_align = len(list(align_dir.glob("*.txt"))) if align_dir.exists() else 0
-    n_adj   = len(list(adj_dir.glob("*.txt"))) if adj_dir.exists() else 0
+    n_align = len(list(align_dir.glob("*.bpaf"))) if align_dir.exists() else 0
+    n_adj   = len(list(adj_dir.glob("*.bpaf"))) if adj_dir.exists() else 0
 
     summary = {
         "sequence_file": str(Path(ns.sequence).resolve()),

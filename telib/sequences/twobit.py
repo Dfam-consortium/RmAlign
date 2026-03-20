@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import io
+import os
 import struct
 from dataclasses import dataclass
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from .base import SequenceSource, reverse_complement
 
-__all__ = ["TwoBitSequenceSource"]
+__all__ = ["TwoBitSequenceSource", "write"]
 
 # UCSC 2bit constants
 TWOBIT_SIGNATURE = 0x1A412743
@@ -333,3 +334,253 @@ class TwoBitSequenceSource(SequenceSource):
         frag = s[start - 1 : end]
         return frag if strand != "-" else reverse_complement(frag)
 
+
+# =============================================================================
+# Writer
+# =============================================================================
+
+# Translation table: ASCII byte value → 2-bit encoding (T=0, C=1, A=2, G=3).
+# N, n, and every other character maps to 0 (same bit pattern as T; the actual
+# N positions are captured separately in the nBlocks table).
+_enc_trans_buf = bytearray(256)
+_enc_trans_buf[ord('A')] = _enc_trans_buf[ord('a')] = 2
+_enc_trans_buf[ord('C')] = _enc_trans_buf[ord('c')] = 1
+_enc_trans_buf[ord('G')] = _enc_trans_buf[ord('g')] = 3
+# T, t, N, n, and everything else stays 0
+_ENC_TRANS: bytes = bytes(_enc_trans_buf)
+del _enc_trans_buf
+
+
+def _find_n_blocks(seq: str) -> Tuple[List[int], List[int]]:
+    """Return (starts, sizes) of N/n runs in seq (0-based positions)."""
+    starts: List[int] = []
+    sizes:  List[int] = []
+    n = len(seq)
+    i = 0
+    while i < n:
+        while i < n and seq[i] != 'N' and seq[i] != 'n':
+            i += 1
+        if i >= n:
+            break
+        j = i + 1
+        while j < n and (seq[j] == 'N' or seq[j] == 'n'):
+            j += 1
+        starts.append(i)
+        sizes.append(j - i)
+        i = j
+    return starts, sizes
+
+
+def _find_mask_blocks(seq: str) -> Tuple[List[int], List[int]]:
+    """Return (starts, sizes) of lowercase (soft-masked) runs (0-based positions)."""
+    starts: List[int] = []
+    sizes:  List[int] = []
+    n = len(seq)
+    i = 0
+    while i < n:
+        while i < n and not seq[i].islower():
+            i += 1
+        if i >= n:
+            break
+        j = i + 1
+        while j < n and seq[j].islower():
+            j += 1
+        starts.append(i)
+        sizes.append(j - i)
+        i = j
+    return starts, sizes
+
+
+def _record_byte_size(dna_size: int, n_count: int, mask_count: int) -> int:
+    """Return the number of bytes occupied by one sequence record on disk."""
+    return (
+        4                       # dnaSize  (u32)
+        + 4                     # nBlockCount  (u32)
+        + 4 * n_count           # nBlockStarts[]
+        + 4 * n_count           # nBlockSizes[]
+        + 4                     # maskBlockCount  (u32)
+        + 4 * mask_count        # maskBlockStarts[]
+        + 4 * mask_count        # maskBlockSizes[]
+        + 4                     # reserved  (u32)
+        + (dna_size + 3) // 4   # packed DNA
+    )
+
+
+def _pack_dna(seq: str) -> bytes:
+    """
+    Encode a DNA string into UCSC 2-bit packed bytes.
+
+    Each base occupies 2 bits: T=0, C=1, A=2, G=3.  Four bases are packed
+    into each byte, most-significant bits first.  N/n and any unrecognised
+    character are treated as T (0); the caller is responsible for recording
+    their positions in the nBlocks table.  Trailing bits in the last byte are
+    padded with 0 (T).
+    """
+    n = len(seq)
+    if n == 0:
+        return b""
+
+    # Translate every ASCII character to its 2-bit value (as a full byte 0-3).
+    vals = seq.encode("latin-1").translate(_ENC_TRANS)
+
+    nbytes = (n + 3) >> 2
+    packed = bytearray(nbytes)
+
+    # Full groups of 4 bases → 1 byte each.
+    full = n >> 2
+    for i in range(full):
+        j = i << 2
+        packed[i] = (vals[j] << 6) | (vals[j + 1] << 4) | (vals[j + 2] << 2) | vals[j + 3]
+
+    # Remaining 1–3 bases (left-justified in the last byte).
+    rem = n & 3
+    if rem:
+        j = full << 2
+        b = 0
+        for k in range(rem):
+            b |= vals[j + k] << (6 - k * 2)
+        packed[full] = b
+
+    return bytes(packed)
+
+
+def write(
+    sequences: Iterable[Tuple[str, str]],
+    path: str | os.PathLike,
+    *,
+    mask: bool = False,
+    version: Optional[int] = None,
+) -> None:
+    """
+    Write sequences to a UCSC .2bit file.
+
+    Parameters
+    ----------
+    sequences
+        Iterable of ``(name, seq)`` pairs.  ``seq`` may contain upper- and
+        lowercase ACGT letters plus N/n.
+
+        - N and n are recorded in the nBlocks table so they round-trip
+          correctly; they are stored as T in the packed DNA bytes.
+        - Lowercase letters are optionally recorded in the maskBlocks table
+          (only when *mask* is ``True``).  All packed DNA is stored uppercase
+          regardless.
+
+        The entire iterable is consumed and buffered before writing begins
+        because the file index (which is written first) must contain the
+        absolute offset of every sequence record.
+
+    path
+        Destination ``.2bit`` file.  Any existing file is overwritten.
+
+    mask
+        If ``True``, runs of lowercase letters in each sequence are recorded
+        as soft-mask blocks (maskBlocks).  If ``False`` (default), the
+        maskBlock table is written as empty for every sequence, matching the
+        behaviour of Jim Kent's ``faToTwoBit`` without ``-noMask``.
+
+    version
+        2bit index format version.
+
+        * ``0`` — 32-bit index offsets (default for files ≤ 4 GiB; maximum
+          file size ≈ 4 GiB).  Compatible with all UCSC tools.
+        * ``1`` — 64-bit index offsets.  Required when the file would exceed
+          4 GiB.  Supported by Jim Kent's tools and this reader.
+        * ``None`` (default) — auto-select: use v0 when the file fits within
+          32-bit addressing, v1 otherwise.
+
+    Notes
+    -----
+    Files are written in little-endian byte order, matching the convention
+    used by UCSC tools on x86 platforms.
+
+    Sequence names must be ASCII and at most 255 bytes long (the name-length
+    field is a single byte).
+    """
+    endian = "<"  # little-endian, same as UCSC tools on x86
+
+    # ------------------------------------------------------------------
+    # Phase 1 — buffer and analyse all sequences so we can compute the
+    # exact file layout before writing a single byte.
+    # ------------------------------------------------------------------
+
+    # Each element: (name_bytes, dna_size, n_starts, n_sizes, m_starts, m_sizes, seq)
+    _Rec = Tuple[bytes, int, List[int], List[int], List[int], List[int], str]
+    recs: List[_Rec] = []
+
+    for name, seq in sequences:
+        name_b = name.encode("ascii")
+        if len(name_b) > 255:
+            raise ValueError(
+                f"Sequence name too long for 2bit format (max 255 bytes): {name!r}"
+            )
+        n_starts, n_sizes = _find_n_blocks(seq)
+        m_starts, m_sizes = _find_mask_blocks(seq) if mask else ([], [])
+        recs.append((name_b, len(seq), n_starts, n_sizes, m_starts, m_sizes, seq))
+
+    seq_count = len(recs)
+
+    # ------------------------------------------------------------------
+    # Phase 2 — compute file layout (header + index + records).
+    # ------------------------------------------------------------------
+
+    def _layout(ver: int) -> Tuple[List[int], int]:
+        """Return (per-sequence offsets, total_file_bytes) for the given version."""
+        offset_size = 4 if ver == 0 else 8
+        # Fixed header is always 16 bytes.
+        pos = 16
+        # Index: one entry per sequence.
+        for name_b, *_ in recs:
+            pos += 1 + len(name_b) + offset_size  # nameLen + name + offset
+        offsets: List[int] = []
+        for name_b, dna_size, n_starts, _, m_starts, _, _ in recs:
+            offsets.append(pos)
+            pos += _record_byte_size(dna_size, len(n_starts), len(m_starts))
+        return offsets, pos
+
+    if version is None:
+        _, total_v0 = _layout(0)
+        version = 0 if total_v0 <= 0xFFFFFFFF else 1
+
+    if version not in (0, 1):
+        raise ValueError(f"version must be 0 or 1, got {version!r}")
+
+    offsets, _ = _layout(version)
+
+    # ------------------------------------------------------------------
+    # Phase 3 — write the file in a single sequential pass.
+    # ------------------------------------------------------------------
+
+    offset_fmt = f"{endian}I" if version == 0 else f"{endian}Q"
+
+    with open(path, "wb") as f:
+
+        # ---- File header (16 bytes) ----
+        f.write(struct.pack(f"{endian}IIII", TWOBIT_SIGNATURE, version, seq_count, 0))
+
+        # ---- Index ----
+        for (name_b, *_), offset in zip(recs, offsets):
+            f.write(struct.pack("B", len(name_b)))
+            f.write(name_b)
+            f.write(struct.pack(offset_fmt, offset))
+
+        # ---- Sequence records ----
+        for name_b, dna_size, n_starts, n_sizes, m_starts, m_sizes, seq in recs:
+            n_count = len(n_starts)
+            m_count = len(m_starts)
+
+            f.write(struct.pack(f"{endian}I", dna_size))
+
+            f.write(struct.pack(f"{endian}I", n_count))
+            if n_count:
+                f.write(struct.pack(f"{endian}{n_count}I", *n_starts))
+                f.write(struct.pack(f"{endian}{n_count}I", *n_sizes))
+
+            f.write(struct.pack(f"{endian}I", m_count))
+            if m_count:
+                f.write(struct.pack(f"{endian}{m_count}I", *m_starts))
+                f.write(struct.pack(f"{endian}{m_count}I", *m_sizes))
+
+            f.write(struct.pack(f"{endian}I", 0))  # reserved
+
+            f.write(_pack_dna(seq))

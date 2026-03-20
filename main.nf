@@ -7,9 +7,14 @@ import groovy.json.JsonOutput
 // --------------------
 // Params
 // --------------------
-params.sequence     = params.sequence ?: null
-params.project_dir  = params.project_dir ?: null
-params.lib_file     = params.lib_file   ?: null
+params.sequence            = null
+params.project_dir         = null
+params.library             = null
+params.search_threshold    = 0
+params.final_threshold     = 225
+params.force_update        = false
+params.threads             = 4
+params.log_level           = "INFO"
 
 // --------------------
 // Helpers
@@ -49,7 +54,7 @@ def mapToCliFlags(Map rec) {
 // --------------------
 if (!params.sequence)     fail("Missing required parameter: --sequence <file>")
 if (!params.project_dir)  fail("Missing required parameter: --project_dir <directory>")
-if (!params.lib_file)     fail("Missing required parameter: --lib_file <string>")
+if (!params.library)      fail("Missing required parameter: --library <file>")
 
 def seqPath = file(params.sequence)
 if (!seqPath.exists())    fail("The --sequence path does not exist: ${seqPath}")
@@ -59,19 +64,18 @@ def projDir = ensureProjectDir(params.project_dir)
 
 log.info "Using sequence    : ${seqPath.toAbsolutePath()}"
 log.info "Using project_dir : ${projDir.absolutePath}"
-log.info "Using lib_file    : ${params.lib_file}"
+log.info "Using library     : ${params.library}"
 
 // Singletons
 Channel.value(seqPath.toAbsolutePath().toString()).set { CH_SEQ }
 Channel.value(projDir.absolutePath).set             { CH_PROJ }
-Channel.value(params.lib_file as String).set        { CH_LIB }
+Channel.value(params.library as String).set         { CH_LIB }
+Channel.value(params.search_threshold as int).set   { CH_SEARCH_THRESH }
+Channel.value(params.final_threshold  as int).set   { CH_FINAL_THRESH }
+Channel.value(params.force_update        as Boolean).set { CH_FORCE_UPDATE }
+Channel.value(params.threads             as int).set    { CH_THREADS }
+Channel.value(params.log_level           as String).set { CH_LOG_LEVEL }
 
-// Absolute paths to helper scripts in the repo
-def GEN_ALIGN_SCRIPT = "${projectDir}/generate_align_tasks.py"
-def ALIGN_SCRIPT     = "${projectDir}/align_task.py"
-def GEN_ADJ_SCRIPT   = "${projectDir}/generate_adjudication_tasks.py"
-def ADJ_SCRIPT       = "${projectDir}/adjudicate_task.py"
-def POST_SCRIPT      = "${projectDir}/postprocess_task.py"
 
 // --------------------
 // Workflow
@@ -79,7 +83,7 @@ def POST_SCRIPT      = "${projectDir}/postprocess_task.py"
 workflow {
 
     // Stage 1: generate_align_tasks.py -> produce align_tasks.json and project token
-    GEN_ALIGN_TASKS(CH_SEQ, CH_PROJ, CH_LIB)
+    GEN_ALIGN_TASKS(CH_SEQ, CH_PROJ, CH_LIB, CH_SEARCH_THRESH, CH_FINAL_THRESH, CH_FORCE_UPDATE, CH_LOG_LEVEL)
 
     // Parse align_tasks.jsonl (JSON Lines) and fan out ALIGN tasks
     GEN_ALIGN_TASKS.out.align_json
@@ -103,8 +107,10 @@ workflow {
         .flatten()
         .combine( GEN_ALIGN_TASKS.out.proj_after_align )
         .combine( CH_SEQ )
-        .combine( CH_LIB )
-        .map { rec, proj, seq, lib_file -> [ rec as Map, seq as String, proj as String, lib_file as String ] }
+        .map { rec, proj, seq -> [ rec as Map, seq as String, proj as String, "${proj}/sequence/lib-cons.fa" as String ] }
+        .combine( CH_THREADS )
+        .combine( CH_LOG_LEVEL )
+        .map { rec, seq, proj, lib, threads, log_level -> [ rec as Map, seq as String, proj as String, lib as String, threads as int, log_level as String ] }
         .set { CH_ALIGN_TUPLES }
 
 
@@ -151,20 +157,31 @@ process GEN_ALIGN_TASKS {
     input:
     val seq
     val proj
-    val lib_file
+    val library
+    val search_threshold
+    val final_threshold
+    val force_update
+    val log_level
 
     output:
     path "align_tasks.json", emit: align_json
     val(proj),             emit: proj_after_align
 
     script:
+    def search_flag    = search_threshold > 0 ? "--search-threshold ${search_threshold}" : ""
+    def force_upd_flag = force_update         ? "--force-update"                         : ""
     """
     set -euo pipefail
-    python3 "${GEN_ALIGN_SCRIPT}" \\
+    generate_align_tasks.py \\
       --sequence ${seq} \\
       --project_dir ${proj} \\
-      --emit-batches-gcbin \\
-      --library ${lib_file}
+      --batch-method gc_bin \\
+      --library ${library} \\
+      --final-threshold ${final_threshold} \\
+      --log-level ${log_level} \\
+      --log-file ${proj}/logs/generate_align_tasks.log \\
+      ${search_flag} \\
+      ${force_upd_flag}
     # Expose the JSON file to Nextflow as a process output
     ln -sf "${proj}/jobs/align_tasks.jsonl" align_tasks.json
     """
@@ -176,7 +193,7 @@ process ALIGN_TASK {
     tag { "align_${rec.family ?: 'x'}__${rec.sequence ?: 'x'}" }
 
     input:
-    tuple val(rec), val(seq), val(proj), val(lib_file)
+    tuple val(rec), val(seq), val(proj), val(library), val(threads), val(log_level)
 
     output:
     path "*.align.done", emit: done_tokens
@@ -185,21 +202,26 @@ process ALIGN_TASK {
     rec != null
 
     script:
-    def flags = mapToCliFlags(rec)
     def fam   = (rec.family ?: 'x').toString()
     def label = (rec.sequence ?: 'x').toString()
-    def token = "align_${fam}__${label}.align.done"
+    def gcbin = label.replaceFirst(/\.fa$/, '')
+    def token = "align_${fam}_${gcbin}.align.done"
     """
-    python3 "${ALIGN_SCRIPT}" \\
-      --output ${proj}/results/ALIGN/${fam}__${label}.out \\
+    align_task.py \\
+      --output ${proj}/results/ALIGN/${fam}_${gcbin}.bpaf \\
       --sequence ${proj}/sequence/${rec.sequence} \\
       --family ${fam} \\
       --div ${rec.div} \\
       --gc  ${rec.gc} \\
-      --threshold ${rec.threshold} \\
-      --tmpdir ${proj} \\
-      --library ${lib_file} \\
-      --threads 4
+      --search-threshold ${rec.search_threshold ?: 180} \\
+      --final-threshold  ${rec.final_threshold  ?: 0} \\
+      --bin_bases ${rec.bin_bases ?: 0} \\
+      --full_seq_bases ${rec.full_seq_bases ?: 0} \\
+      --bins ${proj}/sequence/bins.tsv \\
+      --library ${library} \\
+      --threads ${threads} \\
+      --log-level ${log_level} \\
+      --log-file ${proj}/logs/align_${fam}_${gcbin}.log
     echo done > ${token}
     """
 }
@@ -222,7 +244,7 @@ process GEN_ADJ_TASKS {
     """
     set -euo pipefail
     # barrier consumed via 'align_done_list'
-    python3 "${GEN_ADJ_SCRIPT}" \\
+    generate_adjudication_tasks.py \\
       --sequence ${seq} \\
       --project_dir ${proj} \\
       --species ${species}
@@ -250,7 +272,7 @@ process ADJUDICATE_TASK {
     def token = "adjudicate_${batch}.adj.done"
     """
     set -euo pipefail
-    python3 "${ADJ_SCRIPT}" \\
+    adjudicate_task.py \\
       --sequence ${seq} \\
       --project_dir ${proj} \\
       --species ${species} \\
@@ -275,7 +297,7 @@ process POSTPROCESS_TASK {
     script:
     """
     set -euo pipefail
-    python3 "${POST_SCRIPT}" \\
+    postprocess_task.py \\
       --sequence ${seq} \\
       --project_dir ${proj} \\
       --species ${species}

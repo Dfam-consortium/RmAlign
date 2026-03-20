@@ -1,0 +1,49 @@
+
+ * Versioning
+   - Let's start using semantic versioning for RM
+        - The manifest stores the previous version used.  When should it care
+          that the version doesn't match?
+             Major: Compatibilty breaking changes
+             Minor: Backward Compatible Release
+                      - Existing scripts workflows should continue to work but 
+                        new features are now present should they choose to use
+                        them.
+             Patch: Backward Compatible Bugfix
+                      - Upgrade without any worries that a workflow or script using this
+                        will break.
+
+    - Currently we consider "Minor" version updates to required --force_update on projects....should we?
+
+
+  * Config
+    - We should have some form of configuration interface for the codebase.
+        This should have fallbacks from 
+            1) environment variables
+            2) config file settings
+            3) PATH settings
+
+
+  * Incremental changes not caught:
+     - families in which the s_thresh changed....or div changed
+
+
+  * bpaf files are in batch sequence space (e.g batch identifiers and coordinates), consider if we want to leave it that way (e.g later
+    concern) or put in global space on disk.  What about overlap pre-processing....e.g. at what stage should we pre-adjudicate the
+    redundant alignments in these overlap regions.  Probably before aurora
+
+
+  * Test restarting a job....does it work? -- nope...at least not through the RepeatMasker script
+
+
+  * Don't keep empty logs in logs folder
+
+
+  * results/ALIGN should probably be results/align/family/* to keep the number of files in a directory down
+
+  * Beware of default divergence being used if "div=" is not in library file (default:18)
+
+
+  * Beware the GC bins are different than the way RM did it.  RM tried to modify the bin-size so that there wasn't an "remainder" bin.
+    - I mean that is pretty cool...since it is strand invariant.....talk about it
+
+

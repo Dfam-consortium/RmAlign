@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "rmalign"
+dynamic = ["version"]
+description = "Family-wise transposable element alignment pipeline"
+requires-python = ">=3.10"
+
+[tool.setuptools.dynamic]
+version = {file = "_version.py"}

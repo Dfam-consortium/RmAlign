@@ -66,6 +66,7 @@ class BpafRecord:
     scoring_system: Optional[str] = None
     score_f: Optional[float] = None
     evalue_f: Optional[float] = None
+    bit_score_f: Optional[float] = None
     div_pm: Optional[int] = None
     bpaf_cigar: Optional[BpafCigar] = None
     aligned_query_seq: Optional[str] = None
@@ -322,14 +323,16 @@ def _decode_record(buf: bytes, i: int, qids: list[str], tids: list[str], mats: l
     midx, i = _get_uleb(buf, i)
 
     flags = buf[i]; i += 1
-    score_f = evalue_f = None
+    score_f = evalue_f = bit_score_f = None
     div_pm = None
     if flags & (1 << 1):  # HAS_SCORE
         (score_f,) = struct.unpack_from("<f", buf, i); i += 4
-    if flags & (1 << 2):  # HAS_EVAL
-        (evalue_f,) = struct.unpack_from("<f", buf, i); i += 4
+    if flags & (1 << 2):  # HAS_EVAL (always float64)
+        (evalue_f,) = struct.unpack_from("<d", buf, i); i += 8
     if flags & (1 << 3):  # HAS_DIV
         (div_pm,) = struct.unpack_from("<H", buf, i); i += 2
+    if flags & (1 << 4):  # HAS_BITSCORE (float32)
+        (bit_score_f,) = struct.unpack_from("<f", buf, i); i += 4
 
     cigar, i = _decode_cigar(buf, i)
     i = end  # safety
@@ -345,6 +348,7 @@ def _decode_record(buf: bytes, i: int, qids: list[str], tids: list[str], mats: l
         scoring_system=mats[midx] if 0 <= midx < len(mats) else "unknown.scoring_system",
         score_f=score_f,
         evalue_f=evalue_f,
+        bit_score_f=bit_score_f,
         div_pm=div_pm,
         bpaf_cigar=cigar,
     )
@@ -458,6 +462,7 @@ def decode(
                     orientation="-" if r.orient_c else "+",
                     reference="query",
                     e_value=r.evalue_f,
+                    bit_score=r.bit_score_f,
                     matrix_name=r.scoring_system,
                     aligned_query_seq=getattr(r, "aligned_query_seq", None),
                     aligned_target_seq=getattr(r, "aligned_target_seq", None),
@@ -556,15 +561,19 @@ def encode(
         # scoring system
         _put_uleb(midx, rec)
         # flags + optionals
-        FLG_ORIENT_C = 1 << 0; FLG_HAS_SCORE = 1 << 1; FLG_HAS_EVAL = 1 << 2; FLG_HAS_DIV = 1 << 3
+        FLG_ORIENT_C   = 1 << 0; FLG_HAS_SCORE    = 1 << 1
+        FLG_HAS_EVAL   = 1 << 2; FLG_HAS_DIV      = 1 << 3
+        FLG_HAS_BITSCORE = 1 << 4
         flags = (FLG_ORIENT_C if r.orient_c else 0)
-        if r.score_f is not None: flags |= FLG_HAS_SCORE
-        if r.evalue_f is not None: flags |= FLG_HAS_EVAL
-        if r.div_pm is not None:   flags |= FLG_HAS_DIV
+        if r.score_f is not None:     flags |= FLG_HAS_SCORE
+        if r.evalue_f is not None:    flags |= FLG_HAS_EVAL
+        if r.div_pm is not None:      flags |= FLG_HAS_DIV
+        if r.bit_score_f is not None: flags |= FLG_HAS_BITSCORE
         rec.append(flags & 0xFF)
-        if flags & FLG_HAS_SCORE: rec.extend(struct.pack("<f", float(r.score_f)))
-        if flags & FLG_HAS_EVAL:  rec.extend(struct.pack("<f", float(r.evalue_f)))
-        if flags & FLG_HAS_DIV:   rec.extend(struct.pack("<H", int(r.div_pm)))
+        if flags & FLG_HAS_SCORE:    rec.extend(struct.pack("<f", float(r.score_f)))
+        if flags & FLG_HAS_EVAL:     rec.extend(struct.pack("<d", float(r.evalue_f)))   # float64
+        if flags & FLG_HAS_DIV:      rec.extend(struct.pack("<H", int(r.div_pm)))
+        if flags & FLG_HAS_BITSCORE: rec.extend(struct.pack("<f", float(r.bit_score_f)))
         # cigar
         _encode_cigar(r.bpaf_cigar, rec)
         # emit [uleb(len), rec]
@@ -584,6 +593,7 @@ def encode(
             scoring_system=a.matrix_name or "unknown.scoring_system",
             score_f=float(a.score) if isinstance(a.score, (int, float)) else None,
             evalue_f=getattr(a, "e_value", None),
+            bit_score_f=getattr(a, "bit_score", None),
             div_pm=None,
             bpaf_cigar=cig,
         ))

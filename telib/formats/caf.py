@@ -18,30 +18,32 @@ class CafRecord:
     """
     Neutral CAF record (strict one-line CSV flavor).
 
-    Field order mirrors the CSV we read/write:
-      0  score         (float)
-      1  perc_sub      (float)
-      2  perc_del      (float)
-      3  perc_ins      (float)
-      4  qid           (str)
-      5  qs            (int, 1-based)
-      6  qe            (int, 1-based)
-      7  qrem          (Optional[int], leftover bases to Q end)
-      8  sid           (str)
-      9  [unused]      (empty placeholder)
-      10 ss            (int, 1-based)
-      11 se            (int, 1-based)
-      12 srem          (Optional[int], leftover bases to S end)
-      13 orient_c      ("1" for complemented target; else "0")
-      14 [unused]      (empty)
-      15 [unused]      (empty)
-      16 encoded       (CAF condensed alignment string)
-      17 matrix        (Optional[str])
-      18.. trailing empties (ignored)
+    Field order mirrors the CSV we read/write (0-indexed, 1-indexed in spec):
+      0  / 1   score                  (float) bit, raw, complexity-adjusted, or e-value
+      1  / 2   perc_sub               (float) % mismatched non-gap characters
+      2  / 3   perc_del               (float) % deletion characters
+      3  / 4   perc_ins               (float) % insertion characters
+      4  / 5   qid                    (str)   query sequence ID
+      5  / 6   qs                     (int, 1-based) query start
+      6  / 7   qe                     (int, 1-based) query end
+      7  / 8   qrem                   (Optional[int]) remaining query bases
+      8  / 9   sid                    (str)   subject sequence ID
+      9  / 10  subject_classification (Optional[str]) Dfam/RM classification
+      10 / 11  ss                     (int, 1-based) subject start
+      11 / 12  se                     (int, 1-based) subject end
+      12 / 13  srem                   (Optional[int]) remaining subject bases
+      13 / 14  orient_c               (bool) True = negative strand
+      14 / 15  overlap                (Optional[str]) overlapping annotation flag
+      15 / 16  linkage_id             (Optional[str]) RepeatMasker linkage ID
+      16 / 17  encoded                (str)  CAF condensed alignment string
+      17 / 18  matrix                 (Optional[str]) scoring matrix name
+      18 / 19  e_value                (Optional[float]) alignment E-value
+      19 / 20  raw_score              (Optional[float]) raw matrix/gap score (pre-complexity-adjust)
+      20 / 21  bit_score              (Optional[float]) bit score
 
     Notes
     -----
-    • CAF encoding is ALWAYS **relative to the query** (the “reference” row):
+    • CAF encoding is ALWAYS **relative to the query** (the 'reference' row):
         +AAA+ → insertion w.r.t query  (query: --- ; target: AAA)
         -AAA- → deletion  w.r.t query  (query: AAA ; target: ---)
         Q/T   → mismatch    (query base Q, target base T)
@@ -65,6 +67,12 @@ class CafRecord:
     orient_c: bool
     encoded: str
     matrix: Optional[str] = None
+    subject_classification: Optional[str] = None
+    overlap: Optional[str] = None
+    linkage_id: Optional[str] = None
+    e_value: Optional[float] = None
+    raw_score: Optional[float] = None
+    bit_score: Optional[float] = None
 
 
 # -------------------------------------------------------------------
@@ -213,19 +221,36 @@ def _caf_build_from_aligned(query_row: str, target_row: str) -> str:
     return "".join(out)
 
 
+def _parse_float_field(parts: list[str], idx: int) -> Optional[float]:
+    if idx < len(parts) and parts[idx]:
+        try:
+            return float(parts[idx])
+        except ValueError:
+            pass
+    return None
+
+def _parse_str_field(parts: list[str], idx: int) -> Optional[str]:
+    return parts[idx] if idx < len(parts) and parts[idx] else None
+
 def _parse_record_line(parts: list[str]) -> Optional[CafRecord]:
-    if len(parts) < 18:
+    if len(parts) < 17:
         return None
     try:
         score = float(parts[0]); psub = float(parts[1]); pdel = float(parts[2]); pins = float(parts[3])
         qid = parts[4]; qs = int(parts[5]); qe = int(parts[6])
         qrem = int(parts[7]) if parts[7] else None
         sid = parts[8]
+        subject_classification = _parse_str_field(parts, 9)
         ss = int(parts[10]); se = int(parts[11])
         srem = int(parts[12]) if parts[12] else None
         orient_c = (parts[13].strip() == "1")
+        overlap    = _parse_str_field(parts, 14)
+        linkage_id = _parse_str_field(parts, 15)
         encoded = parts[16]
-        matrix = parts[17] if parts[17] else None
+        matrix    = _parse_str_field(parts, 17)
+        e_value   = _parse_float_field(parts, 18)
+        raw_score = _parse_float_field(parts, 19)
+        bit_score = _parse_float_field(parts, 20)
     except Exception:
         return None
 
@@ -233,21 +258,30 @@ def _parse_record_line(parts: list[str]) -> Optional[CafRecord]:
         score=score, perc_sub=psub, perc_del=pdel, perc_ins=pins,
         qid=qid, qs=qs, qe=qe, qrem=qrem,
         sid=sid, ss=ss, se=se, srem=srem,
-        orient_c=orient_c, encoded=encoded, matrix=matrix
+        orient_c=orient_c, encoded=encoded,
+        matrix=matrix,
+        subject_classification=subject_classification,
+        overlap=overlap,
+        linkage_id=linkage_id,
+        e_value=e_value,
+        raw_score=raw_score,
+        bit_score=bit_score,
     )
 
 
 def _record_to_csv_line(r: CafRecord) -> str:
-    orient = "1" if r.orient_c else "0"
-    matrix = r.matrix or "unknown.scoring_system"
-    # Keep placeholders to match historic CSV positions (two empties after sid; three empties at tail)
+    orient     = "1" if r.orient_c else "0"
+    matrix_str = r.matrix or ""
+    evalue_str = f"{r.e_value:.6e}"   if r.e_value   is not None else ""
+    raw_str    = f"{r.raw_score:.2f}" if r.raw_score  is not None else ""
+    bit_str    = f"{r.bit_score:.2f}" if r.bit_score  is not None else ""
     return (
         f"{r.score:.2f},{r.perc_sub:.2f},{r.perc_del:.2f},{r.perc_ins:.2f},"
         f"{r.qid},{r.qs},{r.qe},{r.qrem or ''},"
-        f"{r.sid},,"
+        f"{r.sid},{r.subject_classification or ''},"
         f"{r.ss},{r.se},{r.srem or ''},"
-        f"{orient},,,"
-        f"{r.encoded},{matrix},,,\n"
+        f"{orient},{r.overlap or ''},{r.linkage_id or ''},"
+        f"{r.encoded},{matrix_str},{evalue_str},{raw_str},{bit_str}\n"
     )
 
 
@@ -310,21 +344,30 @@ def decode(source: Source, *, cls: Type[T] = CafRecord) -> Iterator[T]:
                     orientation="-" if r.orient_c else "+",
                     matrix_name=r.matrix or "unknown.scoring_system",
                     perc_sub=r.perc_sub,  # pass-through only
+                    e_value=r.e_value,
+                    bit_score=r.bit_score,
                 )
                 # Reconstruct aligned strings from CAF (query is reference)
                 q_aln, t_aln = _caf_decode_to_aligned(r.encoded)
                 aln.aligned_query_seq = q_aln
                 aln.aligned_target_seq = t_aln
 
-                # Preserve leftovers if present (carry-through only)
-                if hasattr(aln, "meta_update"):
-                    meta = {}
-                    if r.qrem is not None:
-                        meta["query_left"] = int(r.qrem)
-                    if r.srem is not None:
-                        meta["subject_left"] = int(r.srem)
-                    if meta:
-                        aln.meta_update(meta)
+                # Carry through optional CAF fields via meta
+                meta: dict = {}
+                if r.qrem is not None:
+                    meta["query_left"] = int(r.qrem)
+                if r.srem is not None:
+                    meta["subject_left"] = int(r.srem)
+                if r.subject_classification is not None:
+                    meta["classification"] = r.subject_classification
+                if r.overlap is not None:
+                    meta["overlap"] = r.overlap
+                if r.linkage_id is not None:
+                    meta["linkage_id"] = r.linkage_id
+                if r.raw_score is not None:
+                    meta["raw_score"] = r.raw_score
+                if meta:
+                    aln.meta_update(meta)
 
                 yield aln
         return _gen()  # type: ignore[return-value]
@@ -365,15 +408,21 @@ def encode(
                 pdel = float(x.target_gap_pct) if getattr(x, "target_gap_pct", None) is not None else 0.0
                 pins = float(x.query_gap_pct) if getattr(x, "query_gap_pct", None) is not None else 0.0
 
-                # qrem/srem from meta only
-                qrem = None
-                srem = None
+                # optional fields from meta
                 meta_get = getattr(x, "meta_get", None)
+                qrem = srem = None
+                subject_classification = overlap = linkage_id = None
+                raw_score = None
                 if callable(meta_get):
-                    qleft = meta_get("query_left")
-                    sleft = meta_get("subject_left")
-                    qrem = int(qleft) if qleft is not None else None
-                    srem = int(sleft) if sleft is not None else None
+                    qleft  = meta_get("query_left")
+                    sleft  = meta_get("subject_left")
+                    qrem   = int(qleft) if qleft is not None else None
+                    srem   = int(sleft) if sleft is not None else None
+                    subject_classification = meta_get("classification")
+                    overlap    = meta_get("overlap")
+                    linkage_id = meta_get("linkage_id")
+                    rs = meta_get("raw_score")
+                    raw_score = float(rs) if rs is not None else None
 
                 yield CafRecord(
                     score=float(x.score),
@@ -390,7 +439,13 @@ def encode(
                     srem=srem,
                     orient_c=(x.orientation == "-"),
                     encoded=encoded,
-                    matrix=x.matrix_name or "unknown.scoring_system",
+                    matrix=x.matrix_name or "",
+                    subject_classification=subject_classification,
+                    overlap=overlap,
+                    linkage_id=linkage_id,
+                    e_value=getattr(x, "e_value", None),
+                    raw_score=raw_score,
+                    bit_score=getattr(x, "bit_score", None),
                 )
             else:
                 raise TypeError("encode() items must be PairwiseAlignment or CafRecord")

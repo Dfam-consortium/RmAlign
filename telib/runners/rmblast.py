@@ -1,5 +1,6 @@
 # telib/runners/rmblast.py
 from __future__ import annotations
+import logging
 import os
 import shlex
 import shutil
@@ -8,6 +9,8 @@ import threading
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Iterable, Iterator, List, Optional, Sequence
+
+logger = logging.getLogger(__name__)
 
 from telib import PairwiseAlignment
 from telib.formats import rmblast as fmt_rmblast
@@ -41,6 +44,8 @@ class RmblastOptions:
     gapextend: int = 5
     mask_level: int = 80
     complexity_adjust: bool = True
+    # 0=(auto) split by database, 1=split by queries
+    mt_mode: int = 0
     word_size: int = 14
     xdrop_ungap: int = 400
     xdrop_gap_final: int = 200
@@ -76,6 +81,7 @@ class RmblastOptions:
         _add("-gapextend", self.gapextend)
         _add("-mask_level", self.mask_level)
         _add("-complexity_adjust", self.complexity_adjust, boolflag=True)
+        _add("-mt_mode", self.mt_mode)
         _add("-word_size", self.word_size)
         _add("-xdrop_ungap", self.xdrop_ungap)
         _add("-xdrop_gap_final", self.xdrop_gap_final)
@@ -172,6 +178,7 @@ def run_rmblast(opts: RmblastOptions) -> Iterator[PairwiseAlignment]:
         _validate_inputs(opts, env)
 
     cmd = opts.build_cmd()
+    logger.debug("rmblastn command: %s", shlex.join(cmd))
 
     # ring buffer of recent stderr lines for nice error messages
     stderr_tail: deque[str] = deque(maxlen=200)
