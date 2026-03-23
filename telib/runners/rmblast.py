@@ -66,6 +66,9 @@ class RmblastOptions:
     # Pre-flight validation toggle
     validate_inputs: bool = True
 
+    # Suppress NCBI usage reporting (sets NCBI_USAGE_REPORT_ENABLED=0)
+    disable_usage_reporting: bool = False
+
     def build_cmd(self) -> List[str]:
         cmd: List[str] = [self.exe, "-db", self.db_path, "-query", self.query_fasta]
 
@@ -103,6 +106,8 @@ class RmblastOptions:
 
     def build_env(self) -> dict:
         env = os.environ.copy()
+        if self.disable_usage_reporting:
+            env["NCBI_USAGE_REPORT_ENABLED"] = "0"
         if self.blastmat_dir:
             env["BLASTMAT"] = self.blastmat_dir
         return env

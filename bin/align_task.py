@@ -353,6 +353,7 @@ def main() -> int:
                 mt_mode=1,
                 mask_level=1, # TODO make this a paraemter?
                 word_size=7, # TODO make this a parameter?
+                disable_usage_reporting=True,
             )
 
             matrix_key = matrix_name.replace(".matrix", "")
