@@ -219,7 +219,7 @@ def main() -> int:
     print("##")
     # Build the Nextflow command
     nf_cmd = [
-        nf_exe, "run", main_nf,
+        nf_exe, "run", main_nf, "-offline",
         "--sequence", sequence_abs,
         "--project_dir", project_abs,
     ]
@@ -247,7 +247,8 @@ def main() -> int:
     run_start = time.time()
 
     try:
-        proc = subprocess.run(nf_cmd, check=False)
+        nf_env = {**os.environ, "NXF_DISABLE_CHECK_LATEST": "true"}
+        proc = subprocess.run(nf_cmd, check=False, env=nf_env)
     except (FileNotFoundError, OSError) as exc:
         print(f"ERROR: could not launch nextflow ({nf_exe!r}): {exc}", file=sys.stderr)
         return 127
